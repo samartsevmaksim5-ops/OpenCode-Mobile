@@ -48,6 +48,10 @@ class LoginActivity : Activity() {
     @Volatile
     private var wakeup = 0
 
+    /** Bumped whenever the current attempt is replaced; a ghost poll from an older attempt sees the change and quits. */
+    @Volatile
+    private var attemptSerial = 0
+
     /** True when the screen was opened to add another account to a profile that already has one. */
     private val adding: Boolean
         get() = app.prefs.signedIn || app.profiles.active.account != null
@@ -128,6 +132,18 @@ class LoginActivity : Activity() {
         showWaiting()
         ServerService.send(this)
         unsubscribe = ServerState.listen { onState(it) }
+
+        // Rotations recreate the activity without state events; sync with the current snapshot at once, otherwise the
+        // screen would claim the Linux environment is still being prepared on a server that already runs.
+        onState(ServerState.snapshot)
+    }
+
+    override fun onResume() {
+        super.onResume()
+
+        // The person may have approved the code in the browser while the screen was backgrounded (or the activity was
+        // recreated by a rotation); pull the account in so the sign-in completes without reopening the screen.
+        if (!minting) app.syncAccountAsync()
     }
 
     override fun onDestroy() {
@@ -169,6 +185,7 @@ class LoginActivity : Activity() {
         // A server restart throws away the attempt the console page is verifying against; start over.
         if (attempt != null && s.phase == Phase.RUNNING && s.generation != attemptGeneration) {
             attempt = null
+            attemptSerial++
             hideNote()
             status.text = tr(
                 "Сервер перезапустился. Код со старой страницы больше не действует - начните вход заново.",
@@ -217,6 +234,7 @@ class LoginActivity : Activity() {
         buttons.addView(
             Ui.button(this, tr("Повторить", "Try again"), palette, primary = true) {
                 attempt = null
+                attemptSerial++
                 hideNote()
 
                 val s = ServerState.snapshot
@@ -246,6 +264,7 @@ class LoginActivity : Activity() {
         buttons.addView(
             Ui.button(this, tr("Выдать новый код", "Issue a new code"), palette) {
                 attempt = null
+                attemptSerial++
                 hideNote()
 
                 val s = ServerState.snapshot
@@ -283,12 +302,14 @@ class LoginActivity : Activity() {
     private fun begin(s: Snapshot, private: Boolean) {
         minting = true
         attemptPrivate = private
+        val serial = ++attemptSerial
+        val pwd = if (app.prefs.remote) app.prefs.remotePassword else app.prefs.password
         hideNote()
         status.text = tr("Запрашиваю страницу входа...", "Requesting the sign-in page...")
         buttons.removeAllViews()
         addSkip()
 
-        val login = ConsoleLogin(HttpTransport(s.baseUrl, app.prefs.password))
+        val login = ConsoleLogin(HttpTransport(s.baseUrl, pwd))
 
         Thread({
             var lastError: String? = null
@@ -308,7 +329,7 @@ class LoginActivity : Activity() {
                     val mintedAt = System.currentTimeMillis()
 
                     runOnUiThread {
-                        if (!alive) return@runOnUiThread
+                        if (!alive || serial != attemptSerial) return@runOnUiThread
 
                         minting = false
                         attempt = started
@@ -320,7 +341,7 @@ class LoginActivity : Activity() {
                         Browser.open(this, started.url, private = private)
                     }
 
-                    poll(login, started, mintedAt)
+                    poll(login, started, mintedAt, serial)
 
                     return@Thread
                 } catch (e: Exception) {
@@ -330,14 +351,16 @@ class LoginActivity : Activity() {
                     if (n == ATTEMPTS || !LoginFault.isRetryable(lastError)) break
 
                     runOnUiThread {
-                        if (alive) status.text = tr("Сервер ещё готовится, попытка ", "The server is warming up, attempt ") + (n + 1) + tr(" из ", " of ") + ATTEMPTS + "..."
+                        if (!alive || serial != attemptSerial) return@runOnUiThread
+
+                        status.text = tr("Сервер ещё готовится, попытка ", "The server is warming up, attempt ") + (n + 1) + tr(" из ", " of ") + ATTEMPTS + "..."
                     }
                     pause(n)
                 }
             }
 
             runOnUiThread {
-                if (!alive) return@runOnUiThread
+                if (!alive || serial != attemptSerial) return@runOnUiThread
 
                 minting = false
                 attempt = null
@@ -360,19 +383,24 @@ class LoginActivity : Activity() {
         }
     }
 
-    private fun poll(login: ConsoleLogin, started: LoginAttempt, mintedAt: Long) {
+    private fun poll(login: ConsoleLogin, started: LoginAttempt, mintedAt: Long, serial: Int) {
         var errors = 0
         var hinted = false
 
         while (alive) {
+            // A newer attempt took over ("issue a new code", retry, a server restart): this poll is a ghost now.
+            if (serial != attemptSerial) return
+
             try {
                 Thread.sleep(2000)
+
+                if (serial != attemptSerial) return
 
                 if (!hinted && System.currentTimeMillis() - mintedAt > HINT_AFTER_MS) {
                     hinted = true
 
                     runOnUiThread {
-                        if (!alive || attempt == null) return@runOnUiThread
+                        if (!alive || attempt == null || serial != attemptSerial) return@runOnUiThread
 
                         note.text = tr(
                             "Если страница пишет, что код не подтверждается, нажмите «Выдать новый код» и откройте её заново.",
@@ -384,12 +412,14 @@ class LoginActivity : Activity() {
 
                 when (val result = login.status(started)) {
                     LoginStatus.Complete -> {
-                        runOnUiThread { done() }
+                        if (serial == attemptSerial) runOnUiThread { done() }
 
                         return
                     }
                     LoginStatus.Expired -> {
                         runOnUiThread {
+                            if (!alive || serial != attemptSerial) return@runOnUiThread
+
                             attempt = null
                             codeBox.visibility = View.GONE
                             hideNote()
@@ -401,6 +431,8 @@ class LoginActivity : Activity() {
                     }
                     is LoginStatus.Failed -> {
                         runOnUiThread {
+                            if (!alive || serial != attemptSerial) return@runOnUiThread
+
                             attempt = null
                             codeBox.visibility = View.GONE
                             hideNote()
@@ -422,6 +454,8 @@ class LoginActivity : Activity() {
                 // A few failed polls in a row are normal while the phone switches apps; keep trying.
                 if (++errors > 15) {
                     runOnUiThread {
+                        if (!alive || serial != attemptSerial) return@runOnUiThread
+
                         attempt = null
                         status.text = tr("Потеряна связь с сервером: ", "Lost the connection to the server: ") + (e.message ?: "")
                         showServerRetry()
@@ -438,10 +472,12 @@ class LoginActivity : Activity() {
     }
 
     private fun done() {
+        val wasAdding = adding
+
         app.prefs.signedIn = true
         UiBus.reloadRequested = true
         app.syncAccountAsync()
-        Ui.toast(this, if (adding) tr("Аккаунт добавлен", "Account added") else tr("Вход выполнен", "Signed in"))
+        Ui.toast(this, if (wasAdding) tr("Аккаунт добавлен", "Account added") else tr("Вход выполнен", "Signed in"))
         reportConnectedAccount()
         finish()
     }
@@ -456,11 +492,13 @@ class LoginActivity : Activity() {
 
         if (s.phase != Phase.RUNNING) return
 
+        val pwd = if (app.prefs.remote) app.prefs.remotePassword else app.prefs.password
+
         Thread({
             runCatching {
                 Thread.sleep(1500)
 
-                val label = ConsoleLogin(HttpTransport(s.baseUrl, app.prefs.password)).signedInAccounts().lastOrNull()?.label
+                val label = ConsoleLogin(HttpTransport(s.baseUrl, pwd)).signedInAccounts().lastOrNull()?.label
                     ?: return@runCatching
 
                 runOnUiThread {

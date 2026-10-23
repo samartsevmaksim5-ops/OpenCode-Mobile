@@ -62,10 +62,17 @@ class JsBridge(private val activity: MainActivity) {
      */
     @JavascriptInterface
     fun rotateWarp() {
-        activity.runOnUiThread {
+        // The tunnel probe does a TCP connect, which must never run on the UI thread (NetworkOnMainThreadException
+        // would be swallowed and the rotation would silently never happen). Probe and rotate on a worker thread.
+        Thread {
             // Without a running tunnel (WARP off, or an account connected) there is nothing to refresh and the page
             // just shows the sign-in offer as before.
-            if (!activity.app.warp.listening()) return@runOnUiThread
+            val up = runCatching { activity.app.warp.listening() }.getOrDefault(false)
+
+            if (!up) {
+                activity.runOnUiThread { Ui.toast(activity, tr("WARP не запущен — подключите аккаунт или включите WARP в настройках", "WARP is not running — connect an account or enable WARP in settings")) }
+                return@Thread
+            }
 
             activity.app.warp.rotate("page limit error") { ok ->
                 activity.runOnUiThread {
@@ -79,8 +86,17 @@ class JsBridge(private val activity: MainActivity) {
                     )
                 }
             }
-        }
+        }.start()
     }
+
+    /**
+     * Whether a WARP tunnel makes sense here: enabled in settings and no personal account on the active profile.
+     * The page uses it to word the quota offer honestly - no tunnel means no "new IP in a few seconds" promise.
+     */
+    @JavascriptInterface
+    fun warpActive(): Boolean = runCatching {
+        activity.app.prefs.warpEnabled && activity.app.profiles.active.account == null
+    }.getOrDefault(false)
 
     @JavascriptInterface
     fun openExternal(url: String) {

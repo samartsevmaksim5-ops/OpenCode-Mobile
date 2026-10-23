@@ -216,6 +216,13 @@ class SettingsActivity : Activity() {
 
             if (!value) app.warp.stop("turned off in settings")
 
+            // The server reads its proxy environment once, at spawn: a toggle while it already runs silently leaves
+            // the old route in place (with WARP off - requests into a dead port), so restart to apply it for real.
+            if (!app.prefs.remote && ServerState.snapshot.phase == Phase.RUNNING) {
+                Ui.toast(this, tr("Перезапускаю сервер, чтобы применить WARP...", "Restarting the server to apply WARP..."))
+                ServerService.send(this, ServerService.ACTION_RESTART)
+            }
+
             render()
         }
 
@@ -224,15 +231,26 @@ class SettingsActivity : Activity() {
             WarpManager.Phase.PREPARING -> tr("Поднимается...", "Coming up...")
             WarpManager.Phase.FAILED -> tr("Ошибка", "Failed")
             WarpManager.Phase.OFF ->
-                if (!app.prefs.warpEnabled) tr("Выключен", "Off") else tr("Поднимется при запуске сервера", "Will come up with the server")
+                when {
+                    !app.prefs.warpEnabled -> tr("Выключен", "Off")
+                    app.profiles.active.account != null -> tr("Не используется: подключён аккаунт", "Not used: an account is connected")
+                    !File(app.paths.nativeLibDir, "libwireproxy.so").exists() -> tr("Недоступен в этой сборке", "Not available in this build")
+                    else -> tr("Поднимется при запуске сервера", "Will come up with the server")
+                }
         }
         val detail = when {
             status.phase == WarpManager.Phase.FAILED && status.detail.isNotEmpty() -> "$label: ${status.detail}"
             status.rotations > 0 -> "$label · ${tr("IP обновлён", "IP refreshed")} ×${status.rotations}"
             else -> label
         }
+        val badgeText = when (status.phase) {
+            WarpManager.Phase.RUNNING -> tr("Вкл", "On")
+            WarpManager.Phase.PREPARING -> tr("...", "...")
+            WarpManager.Phase.FAILED -> tr("Ошибка", "Failed")
+            WarpManager.Phase.OFF -> tr("Нет", "Off")
+        }
 
-        card.line(tr("Состояние", "State"), detail, state(detail, status.phase == WarpManager.Phase.RUNNING || status.phase == WarpManager.Phase.OFF))
+        card.line(tr("Состояние", "State"), detail, state(badgeText, status.phase == WarpManager.Phase.RUNNING || status.phase == WarpManager.Phase.OFF))
 
         card.divide()
         card.action(tr("Обновить IP сейчас", "Refresh the IP now")) {
@@ -296,7 +314,9 @@ class SettingsActivity : Activity() {
         ) {
             val home = Profiles.homeDir(app.paths.profilesDir, active)
 
-            Thread { runCatching { OpencodeStore.signOut(home) } }.apply { isDaemon = true }.start()
+            // Write auth.json synchronously BEFORE the restart: the fresh server must not read the old session back,
+            // or the account would reappear from the still-valid tokens and the sign-out would look like a no-op.
+            runCatching { OpencodeStore.signOut(home) }
             app.prefs.signedIn = false
             app.profiles.setAccount(active.id, null)
             app.prefs.loginSkipped = true
@@ -630,6 +650,10 @@ class SettingsActivity : Activity() {
                     Fs.deleteTree(app.paths.ota)
                     app.paths.rootfsStamp.delete()
                     app.paths.profilesFile.delete()
+                    runCatching { app.warp.stop("erase all app data") }
+                    // The dialog promises a full wipe; leftover prefs would silently restore remote mode, compat,
+                    // banner state and the rest of it on the next launch.
+                    app.prefs.clearAll()
                     runOnUiThread { finishAffinity() }
                 }.apply { isDaemon = true }.start()
             }

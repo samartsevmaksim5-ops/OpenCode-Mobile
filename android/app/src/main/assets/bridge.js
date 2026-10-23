@@ -21,7 +21,13 @@
     var url = createObjectURL.call(URL, object);
 
     try {
-      if (object instanceof Blob) blobs.set(url, object);
+      if (object instanceof Blob) {
+        // A page that never revokes its URLs would otherwise pin every blob until the renderer dies (a renderer
+        // kill mid-chat reads to the person as "the agent thought forever, then an error").
+        if (blobs.size > 24) blobs.delete(blobs.keys().next().value);
+
+        blobs.set(url, object);
+      }
     } catch (e) {}
 
     return url;
@@ -250,14 +256,24 @@
 
   // A person without a connected account hits a bare quota error as soon as the free models run out. Replace that
   // dead end with an offer to sign in, plus a button that opens the app's own sign-in screen.
-  var QUOTA = /(insufficient[_ ]?quota|quota\s*(?:exceeded|exhausted|has been exceeded|will run out|is exhausted)|exceeded\s*(?:your|the|its)?\s*(?:usage|quota|free)|(?:free|usage|request)\s*(?:quota|limit)|(?:credit|credits?|tokens?)\s*(?:exhausted|used up)|\u043a\u0432\u043e\u0442[\u0430\u044b\u0443]?\s*(?:\u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d\u0430|\u0437\u0430\u043a\u043e\u043d\u0447\u0438\u043b\u0430\u0441\u044c|\u043f\u0440\u0435\u0432\u044b\u0448\u0435\u043d\u0430)|(?:\u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d|\u0437\u0430\u043a\u043e\u043d\u0447\u0438\u043b\u0430\u0441\u044c)\s*(?:\u043b\u0438\u043c\u0438\u0442|\u043a\u0432\u043e\u0442\u0430)|\u043b\u0438\u043c\u0438\u0442\s*(?:\u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d|\u043f\u0440\u0435\u0432\u044b\u0448\u0435\u043d|\u0437\u0430\u043a\u043e\u043d\u0447\u0438\u043b\u0441\u044f))/i;
+  var QUOTA = /(insufficient[_ ]?quota|quota\s*(?:exceeded|exhausted|has been exceeded|will run out|is exhausted)|exceeded\s+your\s+current\s+quota|exceeded\s*(?:your|the|its)?\s*(?:usage|quota|free)|plan\s+and\s+billing|(?:free|usage|request)\s*(?:quota|limit)|(?:credit|credits?|tokens?)\s*(?:exhausted|used up)|\b\u043a\u0432\u043e\u0442\w*\s*(?:\u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d\w*|\u043f\u0440\u0435\u0432\u044b\u0448\u0435\u043d\w*|\u0437\u0430\u043a\u043e\u043d\u0447\u0438\u043b\w*)|\b\u043b\u0438\u043c\u0438\u0442\w*\s*(?:\u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d\w*|\u043f\u0440\u0435\u0432\u044b\u0448\u0435\u043d\w*|\u0437\u0430\u043a\u043e\u043d\u0447\u0438\u043b\w*)|(?:\u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d\w*|\u0437\u0430\u043a\u043e\u043d\u0447\u0438\u043b\w*)\s*(?:\u043b\u0438\u043c\u0438\u0442\w*|\u043a\u0432\u043e\u0442\w*))/i;
   var quotaHandled = new WeakSet();
   var lastRotate = 0;
+
+  /** Whether the WARP tunnel is a thing on this setup: without it the replacement text must not promise a new IP. */
+  function warpActive() {
+    try {
+      return !!(native.warpActive && native.warpActive());
+    } catch (e) {
+      return false;
+    }
+  }
 
   function makeSignInButton() {
     var button = document.createElement("button");
 
     button.type = "button";
+    button.setAttribute("data-oc-signin", "1");
     button.textContent = "\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u044c Gmail";
     button.style.cssText =
       "display:inline-block;margin:10px 0 2px;padding:10px 22px;border:0;border-radius:12px;" +
@@ -279,10 +295,23 @@
     return button;
   }
 
+  // Only error surfaces qualify: a text mentioning a limit in a terminal line, a command echo or the chat history is
+  // none of our business, and rewriting it would corrupt what the person sees.
+  function inErrorArea(node) {
+    var host = node.parentElement;
+
+    if (!host || !host.closest) return false;
+
+    if (host.closest('[data-component="terminal-panel"], pre, code, [class*="terminal"]')) return false;
+
+    return !!host.closest('[role="alert"], [class*="error"], [class*="Error"], [data-error], [class*="danger"]');
+  }
+
   function offerSignIn(node) {
     var text = node.nodeValue || "";
 
     if (!text || text.length > 400 || !QUOTA.test(text)) return;
+    if (!inErrorArea(node)) return;
 
     var parent = node.parentElement;
 
@@ -291,10 +320,10 @@
     quotaHandled.add(parent);
 
     // The tunnel rebuild gives a fresh Cloudflare egress IP, which resets the shared anonymous limits. Fire it once
-    // per cooldown so a page full of identical errors cannot hammer the reconnect.
+    // per cooldown so a page full of identical errors cannot hammer the reconnect, and only when a tunnel exists.
     var now = Date.now();
 
-    if (now - lastRotate > 180000) {
+    if (warpActive() && now - lastRotate > 180000) {
       lastRotate = now;
 
       try {
@@ -302,45 +331,79 @@
       } catch (e) {}
     }
 
-    node.nodeValue =
-      "\u041d\u0430 \u044d\u0442\u043e\u043c IP \u043b\u0438\u043c\u0438\u0442\u044b \u0431\u0435\u0441\u043f\u043b\u0430\u0442\u043d\u044b\u0445 \u043c\u043e\u0434\u0435\u043b\u0435\u0439 \u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d\u044b. \u041f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u0435 \u0443\u0436\u0435 \u043f\u0435\u0440\u0435\u0441\u043e\u0437\u0434\u0430\u0451\u0442 \u0442\u0443\u043d\u043d\u0435\u043b\u044c Cloudflare WARP \u2014 " +
-      "\u0447\u0435\u0440\u0435\u0437 \u043f\u0430\u0440\u0443 \u0441\u0435\u043a\u0443\u043d\u0434 \u0431\u0443\u0434\u0435\u0442 \u043d\u043e\u0432\u044b\u0439 IP, \u043e\u0442\u043f\u0440\u0430\u0432\u044c\u0442\u0435 \u0437\u0430\u043f\u0440\u043e\u0441 \u0441\u043d\u043e\u0432\u0430. \u041d\u0430\u0434\u0451\u0436\u043d\u044b\u0439 \u0432\u0430\u0440\u0438\u0430\u043d\u0442 \u2014 \u0441\u0432\u043e\u0439 \u0430\u043a\u043a\u0430\u0443\u043d\u0442: \u043a\u0432\u043e\u0442\u0430 \u0431\u0443\u0434\u0435\u0442 \u043b\u0438\u0447\u043d\u043e\u0439.";
+    node.nodeValue = warpActive()
+      ? "\u041d\u0430 \u044d\u0442\u043e\u043c IP \u043b\u0438\u043c\u0438\u0442\u044b \u0431\u0435\u0441\u043f\u043b\u0430\u0442\u043d\u044b\u0445 \u043c\u043e\u0434\u0435\u043b\u0435\u0439 \u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d\u044b. \u041f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u0435 \u043f\u0435\u0440\u0435\u0441\u043e\u0437\u0434\u0430\u0451\u0442 \u0442\u0443\u043d\u043d\u0435\u043b\u044c Cloudflare WARP \u2014 \u0447\u0435\u0440\u0435\u0437 \u043f\u0430\u0440\u0443 \u0441\u0435\u043a\u0443\u043d\u0434 \u0431\u0443\u0434\u0435\u0442 \u043d\u043e\u0432\u044b\u0439 IP, \u043e\u0442\u043f\u0440\u0430\u0432\u044c\u0442\u0435 \u0437\u0430\u043f\u0440\u043e\u0441 \u0441\u043d\u043e\u0432\u0430. \u041d\u0430\u0434\u0451\u0436\u043d\u044b\u0439 \u0432\u0430\u0440\u0438\u0430\u043d\u0442 \u2014 \u0441\u0432\u043e\u0439 \u0430\u043a\u043a\u0430\u0443\u043d\u0442: \u043a\u0432\u043e\u0442\u0430 \u0431\u0443\u0434\u0435\u0442 \u043b\u0438\u0447\u043d\u043e\u0439."
+      : "\u041b\u0438\u043c\u0438\u0442\u044b \u0431\u0435\u0441\u043f\u043b\u0430\u0442\u043d\u044b\u0445 \u043c\u043e\u0434\u0435\u043b\u0435\u0439 \u043d\u0430 \u044d\u0442\u043e\u0442 \u0447\u0430\u0441 \u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d\u044b. \u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u0435 \u0441\u0432\u043e\u0439 \u0430\u043a\u043a\u0430\u0443\u043d\u0442 \u043d\u0438\u0436\u0435 \u2014 \u043a\u0432\u043e\u0442\u0430 \u0441\u0442\u0430\u043d\u0435\u0442 \u043b\u0438\u0447\u043d\u043e\u0439.";
 
+    // Insert next to the error block, never inside it: the React-owned children would carry the button away on the
+    // next render, and a button inside can also trip React's reconciliation. One button per error block.
     var button = makeSignInButton();
 
-    if (parent.nextElementSibling === null) {
-      parent.appendChild(button);
-    } else {
-      parent.insertBefore(button, parent.nextSibling);
-    }
+    try {
+      var previous = parent.parentElement && parent.parentElement.querySelector('[data-oc-signin]');
+
+      if (previous) previous.remove();
+
+      parent.insertAdjacentElement("afterend", button);
+    } catch (e) {}
   }
 
-  function scanQuota(root) {
+  function scanQuota(root, guard) {
     if (!root) return;
 
     try {
       var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
       var current = walker.currentNode;
-      var guard = 0;
+      var left = guard || 8000;
 
-      while (current && guard < 4000) {
-        guard++;
+      while (current && left > 0) {
+        left--;
         offerSignIn(current);
         current = walker.nextNode();
       }
     } catch (e) {}
   }
 
+  // Nodes touched by mutations: scanned directly, so an error far down a long chat is seen at once instead of
+  // being cut off by the full-scan guard.
+  var touched = new Set();
+
   var quotaTimer = 0;
+  var quotaQueuedAt = 0;
 
   function scheduleQuota() {
+    if (!quotaQueuedAt) quotaQueuedAt = Date.now();
+
     clearTimeout(quotaTimer);
+
+    // Debounce the full scan, but never starve it: a streaming reply mutates constantly, and a plain debounce
+    // would postpone the scan until the stream ends. Cap the wait at one second.
+    var wait = Date.now() - quotaQueuedAt >= 1000 ? 0 : 300;
+
     quotaTimer = setTimeout(function () {
-      scanQuota(document.body);
-    }, 300);
+      quotaQueuedAt = 0;
+
+      var nodes = touched;
+
+      touched = new Set();
+      nodes.forEach(function (node) {
+        scanQuota(node, 1200);
+      });
+      scanQuota(document.body, 8000);
+    }, wait);
   }
 
-  new MutationObserver(scheduleQuota).observe(document.body || document.documentElement, {
+  new MutationObserver(function (mutations) {
+    for (var i = 0; i < mutations.length && i < 200; i++) {
+      var mutation = mutations[i];
+
+      if (mutation.target) touched.add(mutation.target);
+
+      for (var j = 0; j < mutation.addedNodes.length; j++) touched.add(mutation.addedNodes[j]);
+    }
+
+    scheduleQuota();
+  }).observe(document.body || document.documentElement, {
     childList: true,
     subtree: true,
     characterData: true,

@@ -32,6 +32,13 @@ class ServerService : Service() {
     private var wifi: WifiManager.WifiLock? = null
     private val crashes = ArrayDeque<Long>()
 
+    /** Absolute restart budget, independent of the 5-minute crash window. */
+    private var restarts = 0
+
+    /** Last time the server was seen healthy; long healthy stretches reset the restart budget. */
+    @Volatile
+    private var lastAliveAt = 0L
+
     /** Bumped on every start and stop so a watchdog or timer from an earlier run can tell it is stale. */
     @Volatile
     private var epoch = 0
@@ -93,12 +100,17 @@ class ServerService : Service() {
         }
 
         when (intent?.action) {
-            ACTION_STOP -> run {
-                shutdown()
-                main.post {
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
-                }
+            ACTION_STOP -> {
+                // Never queue a stop behind a possibly hung start on the single worker thread: "stop" must stop
+                // now. A dedicated thread does the same idempotent shutdown; the in-flight start bails out on the
+                // next epoch check.
+                Thread {
+                    shutdown()
+                    main.post {
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                    }
+                }.apply { isDaemon = true }.start()
             }
             ACTION_SWITCH -> {
                 intent.getStringExtra(EXTRA_PROFILE)?.let { app.profiles.setActive(it) }
@@ -266,7 +278,7 @@ class ServerService : Service() {
                 }
             }
 
-            val (hint, compat) = server.failureHint(exit)
+            val (hint, compat) = server.failureHint(exit, app.prefs.compat)
 
             Log.w("service", "server did not become healthy (exit=$exit): ${hint.lines().firstOrNull().orEmpty()}")
 
@@ -365,6 +377,7 @@ class ServerService : Service() {
     private fun onRunning(profile: Profile, base: String, password: String, local: Boolean) {
         val my = epoch
         val next = ServerState.snapshot.generation + 1
+        lastAliveAt = System.currentTimeMillis()
 
         ServerState.update {
             it.copy(
@@ -395,7 +408,9 @@ class ServerService : Service() {
 
             app.syncAccountAsync()
             main.removeCallbacks(updateTick)
-            main.post(updateTick)
+            // Not immediately: a fresh start coincides with the busiest network moment, and a check that fails on a
+            // dead link is pure noise; ten minutes in, the connection is settled.
+            main.postDelayed(updateTick, 10 * 60_000L)
         }
     }
 
@@ -414,6 +429,7 @@ class ServerService : Service() {
 
                 if (server.health(base, password) == 200) {
                     misses = 0
+                    lastAliveAt = System.currentTimeMillis()
                 } else if (++misses >= 3) {
                     run { onCrash(my) }
 
@@ -428,17 +444,34 @@ class ServerService : Service() {
 
         val now = System.currentTimeMillis()
 
+        // A crash after a long healthy stretch starts a fresh restart budget.
+        if (lastAliveAt > 0 && now - lastAliveAt > 10 * 60_000L) restarts = 0
+
         crashes.addLast(now)
 
         while (crashes.isNotEmpty() && now - crashes.first() > 5 * 60_000) crashes.removeFirst()
 
         val profile = app.profiles.active
 
-        Log.w("service", "the server stopped answering (${crashes.size} in 5 minutes)")
+        Log.w("service", "the server stopped answering (${crashes.size} in 5 minutes, $restarts in this run)")
 
         if (app.ota.trial) {
             app.ota.failTrial(profile)
             Notifier.update(this, tr("Новая версия сервера работала нестабильно, возвращена предыдущая.", "The new server build was unstable, the previous one was restored."))
+        }
+
+        // Absolute budget: a server dying every minute never fills the 5-minute window, so without this the
+        // service would restart all night long - battery, traffic, notification spam.
+        if (++restarts > MAX_RESTARTS) {
+            epoch++
+            quiet()
+            server.stop()
+
+            val (hint, compat) = server.failureHint(null, app.prefs.compat)
+
+            fail(tr("Сервер падает снова и снова. ", "The server keeps crashing over and over. ") + hint, compat, profile)
+
+            return
         }
 
         if (crashes.size > 3) {
@@ -450,12 +483,12 @@ class ServerService : Service() {
 
                 Log.w("service", "crash loop with signal 11: compatibility mode is on, restarting")
                 Notifier.update(this, tr("Сервер падал; включён режим совместимости, перезапускаю...", "The server kept crashing; compatibility mode is on, restarting..."))
-                startLocal(apply = false)
+                run { startLocal(apply = false) }
 
                 return
             }
 
-            val (hint, compat) = server.failureHint(null)
+            val (hint, compat) = server.failureHint(null, app.prefs.compat)
 
             epoch++
             quiet()
@@ -465,7 +498,9 @@ class ServerService : Service() {
             return
         }
 
-        startLocal(apply = false)
+        // Respawn through the worker queue, not on this watchdog thread: it serializes with other starts/stops and
+        // an uncaught error here would take the whole process down.
+        run { startLocal(apply = false) }
     }
 
     private fun shutdown() {
@@ -610,6 +645,9 @@ class ServerService : Service() {
 
         /** How many times a start may move to the next port after the server found its port taken. */
         private const val MAX_PORT_SHIFTS = 4
+
+        /** Absolute restart attempts allowed before showing the error screen instead of restarting again. */
+        private const val MAX_RESTARTS = 6
         const val ACTION_STOP = "dev.opencode.mobile.STOP"
         const val ACTION_RESTART = "dev.opencode.mobile.RESTART"
         const val ACTION_APPLY = "dev.opencode.mobile.APPLY_UPDATE"

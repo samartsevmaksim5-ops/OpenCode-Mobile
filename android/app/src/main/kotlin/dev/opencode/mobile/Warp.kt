@@ -272,7 +272,10 @@ object Warp {
         append("[Peer]\n")
         append("PublicKey = ${account.peerKey}\n")
         append("AllowedIPs = 0.0.0.0/0, ::/0\n")
-        append("Endpoint = ${account.endpoint}\n\n")
+        append("Endpoint = ${account.endpoint}\n")
+        // Mobile NAT mappings expire on idle; without keepalive the first request after a pause stalls on a
+        // re-handshake and carrier NATs may drop the session entirely.
+        append("PersistentKeepalive = 25\n\n")
         append("[Socks5]\n")
         append("BindAddress = 127.0.0.1:$SOCKS_PORT\n\n")
         append("[http]\n")

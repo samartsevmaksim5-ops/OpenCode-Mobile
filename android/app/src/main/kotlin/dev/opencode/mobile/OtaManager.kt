@@ -75,6 +75,7 @@ class OtaManager(private val context: Context, private val paths: Paths, private
         val installedSeq = synchronized(this) { state.effectiveSeq(BuildConfig.RUNTIME_SEQ) }
         val blocked = synchronized(this) { state.blocked }
         val verified = ArrayList<Offer>()
+        var transportFails = 0
 
         for (release in releases) {
             val manifestUrl = release.assets["manifest.json"] ?: continue
@@ -88,6 +89,11 @@ class OtaManager(private val context: Context, private val paths: Paths, private
                 signature = getBytes(signatureUrl, 8 * 1024)
             } catch (e: Exception) {
                 Log.w("ota", "${release.tag}: ${e.message}")
+
+                // The network just went away: hammering the remaining 29 releases each with two GETs only spams
+                // "Software caused connection abort" and slows the next check; fail fast after a couple of tries.
+                if (++transportFails >= 3) return CheckResult.Failed(e.message ?: e.javaClass.simpleName)
+
                 continue
             }
 

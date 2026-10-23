@@ -91,6 +91,10 @@ class Prefs(context: Context) {
     /** The token commands in the Linux environment present to the app's loopback bridge. */
     val bridgeToken: String get() = secret("bridge_token", 16)
 
+    // The worker thread (server spawn) and the UI thread can both ask for a secret on a fresh install; without the
+    // lock each of them could generate a different value and the last write would win, leaving the server with a
+    // password that is nowhere in the prefs.
+    @Synchronized
     private fun secret(key: String, bytes: Int): String {
         sp.getString(key, null)?.let { return it }
 
@@ -103,5 +107,10 @@ class Prefs(context: Context) {
         sp.edit().putString(key, value).apply()
 
         return value
+    }
+
+    /** Drops every preference - part of "erase all app data", which promises a full wipe. */
+    fun clearAll() {
+        sp.edit().clear().commit()
     }
 }

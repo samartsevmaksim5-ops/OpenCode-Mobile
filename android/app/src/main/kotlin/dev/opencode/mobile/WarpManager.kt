@@ -260,6 +260,7 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
 
         if (existing != null && confFile.exists()) {
             confFile.writeText(Warp.conf(existing))
+            restrictToOwner(confFile)
 
             return
         }
@@ -271,12 +272,28 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
 
         Warp.saveAccount(accountFile, account)
         confFile.writeText(Warp.conf(account))
+        restrictToOwner(accountFile)
+        restrictToOwner(confFile)
         Log.i("warp", "registered identity ${account.id.ifEmpty { "?" }} endpoint=${account.endpoint}")
+    }
+
+    /** The WireGuard private key lives in these files; keep them owner-only as an explicit guarantee. */
+    private fun restrictToOwner(file: File) {
+        runCatching {
+            android.system.Os.chmod(file.absolutePath, 384) // 0600
+        }.onFailure { Log.w("warp", "could not chmod ${file.name}: ${it.message}") }
     }
 
     private fun startProcess() {
         etcDir.mkdirs()
         logFile.parentFile?.mkdirs()
+
+        // The log grows forever otherwise; keep it around one megabyte, like the server log.
+        runCatching {
+            if (logFile.length() > 1_000_000) {
+                logFile.renameTo(File(dir, "wireproxy.log.1"))
+            }
+        }
 
         if (!binary.exists()) throw IllegalStateException(tr("Бинарник WARP отсутствует в сборке", "The WARP binary is missing from this build"))
 
@@ -289,14 +306,49 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
 
         process = builder.start()
 
-        // Watch for an early death (bad config, port busy) so the status stops pretending.
+        // Watch for an early death (bad config, port busy) so the status stops pretending - and bring the tunnel
+        // back: a dead wireproxy under a live server means every model request dies with connection refused until
+        // the next server restart, with nothing in the interface hinting at the real cause.
         val watcher = process
 
         Thread({
             val code = runCatching { watcher?.waitFor() }.getOrNull() ?: return@Thread
 
-            if (watcher === process && wantRunning) {
-                update(Phase.FAILED, tr("Туннель завершился (код ", "The tunnel exited (code ") + code + ")")
+            if (watcher !== process) return@Thread
+
+            synchronized(lock) { if (watcher === process) process = null }
+
+            if (!wantRunning) {
+                update(Phase.OFF, tr("Туннель остановлен", "Tunnel stopped"))
+
+                return@Thread
+            }
+
+            update(Phase.FAILED, tr("Туннель завершился (код ", "The tunnel exited (code ") + code + ")")
+
+            for (attempt in 1..3) {
+                Thread.sleep(if (attempt == 1) 2_000L else 10_000L)
+
+                if (!wantRunning) return@Thread
+
+                synchronized(lock) {
+                    if (!wantRunning || rotating || process != null) return@synchronized
+
+                    try {
+                        update(Phase.PREPARING, tr("Перезапускаю туннель...", "Restarting the tunnel..."))
+                        startProcess()
+                        waitListening()
+                        update(Phase.RUNNING, tr("WARP активен", "WARP is active"))
+                        Log.i("warp", "tunnel respawned (attempt $attempt) after exit code $code")
+                    } catch (e: Exception) {
+                        Log.w("warp", "tunnel respawn failed (attempt $attempt): ${e.message}")
+                        runCatching { process?.destroy() }
+                        process = null
+                        update(Phase.FAILED, e.message ?: "respawn failed")
+                    }
+                }
+
+                if (status.phase == Phase.RUNNING) return@Thread
             }
         }, "warp-watch").apply { isDaemon = true; start() }
     }

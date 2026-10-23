@@ -43,6 +43,12 @@ class PluginsActivity : ExtScreen() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        pickForInstall = savedInstanceState?.getBoolean("pickForInstall") ?: false
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean("pickForInstall", pickForInstall)
     }
 
     // Local plugin files
@@ -191,13 +197,15 @@ class PluginsActivity : ExtScreen() {
                 val target = OpencodeStore.installPluginBytes(home, bytes, name)
 
                 runOnUiThread {
+                    if (isFinishing || isDestroyed) return@runOnUiThread
+
                     render()
                     Ui.toast(this, tr("Установлен: ", "Installed: ") + target.name)
                     askRestart()
                 }
             } catch (e: Exception) {
                 Log.w("plugins", "install failed: ${e.message}")
-                runOnUiThread { Ui.toast(this, tr("Не удалось установить: ", "Could not install: ") + (e.message ?: "")) }
+                runOnUiThread { if (!isFinishing && !isDestroyed) Ui.toast(this, tr("Не удалось установить: ", "Could not install: ") + (e.message ?: "")) }
             }
         }, "plugin-file").apply { isDaemon = true; start() }
     }
@@ -263,6 +271,8 @@ class PluginsActivity : ExtScreen() {
                     val target = OpencodeStore.installPluginBytes(home, bytes, name)
 
                     runOnUiThread {
+                        if (isFinishing || isDestroyed) return@runOnUiThread
+
                         render()
                         Ui.toast(this, tr("Установлен: ", "Installed: ") + target.name)
                         askRestart()
@@ -272,7 +282,7 @@ class PluginsActivity : ExtScreen() {
                 }
             } catch (e: Exception) {
                 Log.w("plugins", "download failed: ${e.message}")
-                runOnUiThread { Ui.toast(this, tr("Не удалось скачать: ", "Could not download: ") + (e.message ?: "")) }
+                runOnUiThread { if (!isFinishing && !isDestroyed) Ui.toast(this, tr("Не удалось скачать: ", "Could not download: ") + (e.message ?: "")) }
             }
         }, "plugin-download").apply { isDaemon = true; start() }
     }

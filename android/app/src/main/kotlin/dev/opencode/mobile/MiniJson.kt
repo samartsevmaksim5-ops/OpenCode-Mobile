@@ -60,7 +60,15 @@ object MiniJson {
             is String -> out.append(quote(value))
             is Boolean -> out.append(if (value) "true" else "false")
             is Int, is Long, is Short, is Byte -> out.append(value.toString())
-            is Double -> out.append(if (value % 1.0 == 0.0 && !value.isInfinite()) value.toLong().toString() else value.toString())
+            // NaN/Infinity are not valid JSON values; writing them bare would corrupt the file (JSON.stringify
+            // maps them to null, and so do we).
+            is Double -> out.append(
+                when {
+                    value.isNaN() || value.isInfinite() -> "null"
+                    value % 1.0 == 0.0 -> value.toLong().toString()
+                    else -> value.toString()
+                },
+            )
             is Float -> writeTo(value.toDouble(), out)
             is Map<*, *> -> {
                 out.append('{')

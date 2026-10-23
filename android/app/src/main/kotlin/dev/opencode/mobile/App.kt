@@ -87,11 +87,22 @@ class App : Application() {
 
         if (snap.phase != Phase.RUNNING || snap.profileId.isEmpty() || prefs.remote) return
 
+        // A permanent failure (e.g. a server build without the integration) must not be retried on every server
+        // restart and every onResume - that is where the every-minute "sync failed" spam in user logs came from.
+        if (snap.generation == accountSyncFailedFor) return
+
         Thread({
+            var generation = snap.generation
+
             runCatching {
-                repeat(3) {
+                repeat(3) { n ->
+                    // The server can restart mid-sync; always talk to the current run or exit.
+                    val now = ServerState.snapshot
+
+                    if (now.phase != Phase.RUNNING || now.generation != generation) return@Thread
+
                     try {
-                        val accounts = ConsoleLogin(HttpTransport(snap.baseUrl, prefs.password)).signedInAccounts()
+                        val accounts = ConsoleLogin(HttpTransport(now.baseUrl, prefs.password)).signedInAccounts()
 
                         // Connections read oldest first; the newest one is whose tokens replaced auth.json, and that
                         // is the account actually spending its quota.
@@ -101,13 +112,32 @@ class App : Application() {
 
                         return@Thread
                     } catch (e: Exception) {
-                        Log.w("account", "sync failed: ${e.message}")
+                        val message = e.message ?: e.javaClass.simpleName
+
+                        Log.w("account", "sync failed: $message")
+
+                        // Deterministic errors (missing integration, bad credentials) will never succeed; park this
+                        // server generation instead of hammering the endpoint every restart.
+                        if (!LoginFault.isRetryable(message) || n == 2) {
+                            accountSyncFailedFor = generation
+
+                            return@Thread
+                        }
+
                         Thread.sleep(3000)
+
+                        if (ServerState.snapshot.generation != generation) return@Thread
+
+                        generation = ServerState.snapshot.generation
                     }
                 }
             }
         }, "account-sync").apply { isDaemon = true; start() }
     }
+
+    /** Server generation whose account sync ended in a permanent failure; no retry until the server restarts anew. */
+    @Volatile
+    private var accountSyncFailedFor = -1
 
     companion object {
         lateinit var instance: App

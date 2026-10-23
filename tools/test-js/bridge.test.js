@@ -34,6 +34,7 @@ function check(name, ok, detail) {
       copyText: (t) => window.calls.push(["copy", t]),
       openLogin: () => window.calls.push(["login"]),
       rotateWarp: () => window.calls.push(["warp"]),
+      warpActive: () => true,
     };
   });
   await page.evaluate(bridge);
@@ -141,11 +142,14 @@ function check(name, ok, detail) {
   const quota = await page.evaluate(async (src) => {
     window.__ocAndroidBridge = false;
     (0, eval)(src);
+    const host = document.createElement("div");
+    host.setAttribute("role", "alert");
     const p = document.createElement("p");
     p.textContent = "Error: insufficient quota";
-    document.body.appendChild(p);
+    host.appendChild(p);
+    document.body.appendChild(host);
     await new Promise((r) => setTimeout(r, 900));
-    // The button goes inside the paragraph when the message block is the last element, next to it otherwise.
+    // The button goes next to the message block, never inside it.
     const button = p.querySelector("button") || p.nextElementSibling;
     const callsBefore = window.calls.length;
     if (button) button.click();
@@ -161,6 +165,29 @@ function check(name, ok, detail) {
   check("quota button text", quota.buttonText === "\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u044c Gmail", String(quota.buttonText));
   check("quota button opens sign-in", quota.opened === true);
   check("quota asks for a WARP rotation", quota.rotated === true);
+
+  // 8b. The watcher must not touch ordinary text or terminal output that merely mentions a limit.
+  const negative = await page.evaluate(async () => {
+    const plain = document.createElement("p");
+    plain.textContent = "I wrote: the request limit was reached last week";
+    document.body.appendChild(plain);
+    const term = document.createElement("div");
+    term.setAttribute("data-component", "terminal-panel");
+    const line = document.createElement("span");
+    line.textContent = "insufficient quota for this team";
+    term.appendChild(line);
+    document.body.appendChild(term);
+    await new Promise((r) => setTimeout(r, 900));
+    return {
+      plain: plain.textContent,
+      line: line.textContent,
+      // The watcher inserts a button as the paragraph's next sibling; look there, not anywhere in the body.
+      plainButton: !!(plain.nextElementSibling && plain.nextElementSibling.hasAttribute("data-oc-signin")),
+      termButton: !!term.querySelector('[data-oc-signin]'),
+    };
+  });
+  check("plain text untouched", negative.plain.includes("request limit") && !negative.plainButton, JSON.stringify(negative));
+  check("terminal untouched", negative.line === "insufficient quota for this team" && !negative.termButton, JSON.stringify(negative));
 
   // 9. Without the native interface the script does nothing and does not throw.
   const quiet = await context.newPage();

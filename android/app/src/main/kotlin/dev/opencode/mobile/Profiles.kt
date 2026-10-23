@@ -36,22 +36,22 @@ class Profiles(private val file: File, private val clock: () -> Long = System::c
         load()
     }
 
-    val all: List<Profile> get() = items.toList()
+    val all: List<Profile> get() = synchronized(this) { items.toList() }
 
-    val active: Profile get() = items.firstOrNull { it.id == activeId } ?: items.first()
+    val active: Profile get() = synchronized(this) { items.firstOrNull { it.id == activeId } ?: items.first() }
 
-    fun find(id: String): Profile? = items.firstOrNull { it.id == id }
+    fun find(id: String): Profile? = synchronized(this) { items.firstOrNull { it.id == id } }
 
-    fun setActive(id: String): Boolean {
-        if (find(id) == null) return false
+    fun setActive(id: String): Boolean = synchronized(this) {
+        if (items.none { it.id == id }) return@synchronized false
 
         activeId = id
         save()
 
-        return true
+        true
     }
 
-    fun create(name: String): Profile {
+    fun create(name: String): Profile = synchronized(this) {
         val slot = (0..MAX_PROFILES).first { candidate -> items.none { it.slot == candidate } }
 
         require(items.size < MAX_PROFILES) { "Too many profiles" }
@@ -61,7 +61,7 @@ class Profiles(private val file: File, private val clock: () -> Long = System::c
         items += profile
         save()
 
-        return profile
+        profile
     }
 
     fun rename(id: String, name: String) {
@@ -87,8 +87,8 @@ class Profiles(private val file: File, private val clock: () -> Long = System::c
     }
 
     /** Removes a profile from the list. The caller deletes its files. The last profile can never be removed. */
-    fun remove(id: String): Boolean {
-        if (items.size <= 1 || find(id) == null) return false
+    fun remove(id: String): Boolean = synchronized(this) {
+        if (items.size <= 1 || items.none { it.id == id }) return@synchronized false
 
         items.removeAll { it.id == id }
 
@@ -96,13 +96,15 @@ class Profiles(private val file: File, private val clock: () -> Long = System::c
 
         save()
 
-        return true
+        true
     }
 
-    private fun update(id: String, change: (Profile) -> Profile) {
+    // The account-sync thread, the service worker and the UI all touch the list (and share one .tmp file when
+    // saving); a single lock keeps the list and the file consistent.
+    private fun update(id: String, change: (Profile) -> Profile) = synchronized(this) {
         val index = items.indexOfFirst { it.id == id }
 
-        if (index < 0) return
+        if (index < 0) return@synchronized
 
         items[index] = change(items[index])
         save()

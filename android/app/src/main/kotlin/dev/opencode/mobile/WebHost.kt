@@ -218,7 +218,9 @@ class WebHost(private val activity: MainActivity) {
         }
 
         override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
-            if (request.isForMainFrame) activity.onPageError(error.description?.toString().orEmpty())
+            // Aborted/cancelled loads (redirects, window.stop(), a superseded navigation) arrive with a non-positive
+            // code and are not failures: the full-screen error view over a live page reads as "the app froze".
+            if (request.isForMainFrame && error.errorCode > 0) activity.onPageError(error.description?.toString().orEmpty())
         }
 
         override fun onReceivedHttpAuthRequest(view: WebView, handler: android.webkit.HttpAuthHandler, host: String, realm: String?) {

@@ -75,7 +75,9 @@ class EventWatcher(
             } catch (_: InterruptedException) {
                 return
             } catch (e: Exception) {
-                if (running) Log.w("events", "stream lost: ${e.message}")
+                // Log only the FIRST failure of an outage: a dead server is retried with backoff every few seconds,
+                // and one warning per reconnect would spam five identical lines before the watchdog reacts.
+                if (running && delay == 2_000L) Log.w("events", "stream lost: ${e.message}")
             } finally {
                 runCatching { connection?.disconnect() }
             }

@@ -85,8 +85,12 @@ class ServerProcess(private val paths: Paths) {
         }.apply { isDaemon = true; start() }
 
         if (!started.waitFor(timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS)) {
-            started.destroyForcibly()
-            killOrphans()
+            // TERM first so proot's --kill-on-exit takes its tracees down with it; a bare SIGKILL would leave the
+            // node/opencode children orphaned and holding the port. No killOrphans() here: this self-test can run
+            // while the real server is up, and a blanket sweep would murder the working server with it.
+            runCatching { started.destroy() }
+
+            if (!started.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) started.destroyForcibly()
 
             return null
         }
@@ -171,7 +175,7 @@ class ServerProcess(private val paths: Paths) {
     }
 
     /** Reads why the server died, to tell the person something more useful than "failed". */
-    fun failureHint(exitCode: Int?): Pair<String, Boolean> {
+    fun failureHint(exitCode: Int?, compatAlready: Boolean = false): Pair<String, Boolean> {
         val tail = attemptLog()
         val lower = tail.lowercase()
         val seccomp = exitCode == 159 || "bad system call" in lower || "sigsys" in lower || "seccomp" in lower
@@ -183,10 +187,17 @@ class ServerProcess(private val paths: Paths) {
                 "Система Android завершила процесс из-за системного вызова. Включите режим совместимости в настройках и повторите.",
                 "Android stopped the process over a system call. Turn on compatibility mode in settings and try again.",
             ) to true
-            segfault -> tr(
-                "Процесс сервера упал с ошибкой памяти (signal 11 внутри proot). Приложение уже перезапускает сервер в режиме совместимости - обычно это лечит. Если ошибка повторяется, напишите в поддержку и приложите журнал кнопкой ниже.",
-                "The server process crashed with a memory fault (signal 11 inside proot). The app already restarts the server in compatibility mode - that usually fixes it. If it keeps crashing, report it in the support chat and attach the log below.",
-            ) to true
+            segfault -> if (compatAlready) {
+                tr(
+                    "Процесс сервера снова упал с ошибкой памяти (signal 11 внутри proot). Режим совместимости уже включён и не помог — напишите в поддержку и приложите журнал кнопкой ниже.",
+                    "The server process crashed with a memory fault (signal 11 inside proot) again. Compatibility mode is already on and did not help - report it in the support chat and attach the log below.",
+                ) to true
+            } else {
+                tr(
+                    "Процесс сервера упал с ошибкой памяти (signal 11 внутри proot). Приложение уже перезапускает сервер в режиме совместимости - обычно это лечит. Если ошибка повторяется, напишите в поддержку и приложите журнал кнопкой ниже.",
+                    "The server process crashed with a memory fault (signal 11 inside proot). The app already restarts the server in compatibility mode - that usually fixes it. If it keeps crashing, report it in the support chat and attach the log below.",
+                ) to true
+            }
             "address already in use" in lower || "eaddrinuse" in lower -> tr(
                 "Порт сервера уже занят. Перезапустите сервер из настроек.",
                 "The server port is already in use. Restart the server from settings.",
