@@ -125,6 +125,7 @@ class ServerService : Service() {
         // The server belongs to this service; leaving it running without a notification would be a hidden process.
         Thread {
             runCatching { server.stop() }.onFailure { Log.w("service", "could not stop the server: ${it.message}") }
+            app.warp.stop("service stopped")
         }.start()
 
         super.onDestroy()
@@ -216,9 +217,14 @@ class ServerService : Service() {
         var otaDir = app.ota.prepareStart(profile, apply)
         var attempt = 0
         var shifts = 0
+        var compatRetried = false
 
         while (true) {
-            val config = server.config(app.prefs, profile, bridgeUrl, otaDir)
+            // The WARP tunnel has to be up before the server starts: the server reads its proxy address from the
+            // environment at spawn time. When the tunnel cannot come up the server simply goes out directly.
+            val warpProxy = app.warp.prepare(profile)
+
+            val config = server.config(app.prefs, profile, bridgeUrl, otaDir, warpProxy)
             val process = try {
                 server.spawn(config)
             } catch (e: Exception) {
@@ -271,6 +277,19 @@ class ServerService : Service() {
                 Notifier.update(this, tr("Новая версия сервера не запустилась, возвращена предыдущая.", "The new server build did not start, the previous one was restored."))
                 otaDir = app.ota.prepareStart(profile, apply = false)
                 attempt++
+
+                continue
+            }
+
+            // A proot segfault (signal 11) kills the server on a handful of devices; the compatibility loader fixes
+            // exactly that. Flip it on once and retry instead of leaving the person on the error screen - with the
+            // current traffic this is what most "сервер постоянно падает" reports come from.
+            if (!app.prefs.compat && server.crashedWithSegfault() && !compatRetried) {
+                app.prefs.compat = true
+                compatRetried = true
+
+                Log.w("service", "signal 11 crash: compatibility mode is on, retrying")
+                Notifier.update(this, tr("Сервер упал; включён режим совместимости, перезапускаю...", "The server crashed; compatibility mode is on, restarting..."))
 
                 continue
             }
@@ -423,6 +442,19 @@ class ServerService : Service() {
         }
 
         if (crashes.size > 3) {
+            // The watchdog flavour of the same signal 11 problem: one self-heal attempt with the compatibility loader
+            // before giving up, so an overnight crash loop ends in a working server instead of an error screen.
+            if (!app.prefs.compat && server.crashedWithSegfault()) {
+                app.prefs.compat = true
+                crashes.clear()
+
+                Log.w("service", "crash loop with signal 11: compatibility mode is on, restarting")
+                Notifier.update(this, tr("Сервер падал; включён режим совместимости, перезапускаю...", "The server kept crashing; compatibility mode is on, restarting..."))
+                startLocal(apply = false)
+
+                return
+            }
+
             val (hint, compat) = server.failureHint(null)
 
             epoch++

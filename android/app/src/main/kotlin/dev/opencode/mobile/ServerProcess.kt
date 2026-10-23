@@ -14,7 +14,7 @@ class ServerProcess(private val paths: Paths) {
     /** Where the server log stood when the running attempt started, so only that attempt is inspected on failure. */
     private var logMark: Long = 0
 
-    fun config(prefs: Prefs, profile: Profile, bridgeUrl: String, otaDir: File?): ProotConfig {
+    fun config(prefs: Prefs, profile: Profile, bridgeUrl: String, otaDir: File?, warpProxy: String? = null): ProotConfig {
         val home = Profiles.homeDir(paths.profilesDir, profile)
 
         return ProotConfig(
@@ -33,6 +33,7 @@ class ServerProcess(private val paths: Paths) {
             bindSharedStorage = prefs.bindStorage,
             timeZone = java.util.TimeZone.getDefault().id,
             otaBinDir = otaDir?.path,
+            proxy = warpProxy,
         )
     }
 
@@ -174,12 +175,17 @@ class ServerProcess(private val paths: Paths) {
         val tail = attemptLog()
         val lower = tail.lowercase()
         val seccomp = exitCode == 159 || "bad system call" in lower || "sigsys" in lower || "seccomp" in lower
+        val segfault = ProotCommand.segfaultIn(tail)
         val lines = tail.lines().filter { it.isNotBlank() }.takeLast(8).joinToString("\n")
 
         return when {
             seccomp -> tr(
                 "Система Android завершила процесс из-за системного вызова. Включите режим совместимости в настройках и повторите.",
                 "Android stopped the process over a system call. Turn on compatibility mode in settings and try again.",
+            ) to true
+            segfault -> tr(
+                "Процесс сервера упал с ошибкой памяти (signal 11 внутри proot). Приложение уже перезапускает сервер в режиме совместимости - обычно это лечит. Если ошибка повторяется, напишите в поддержку и приложите журнал кнопкой ниже.",
+                "The server process crashed with a memory fault (signal 11 inside proot). The app already restarts the server in compatibility mode - that usually fixes it. If it keeps crashing, report it in the support chat and attach the log below.",
             ) to true
             "address already in use" in lower || "eaddrinuse" in lower -> tr(
                 "Порт сервера уже занят. Перезапустите сервер из настроек.",
@@ -191,6 +197,9 @@ class ServerProcess(private val paths: Paths) {
 
     /** What the current attempt printed, so an earlier attempt in the same log cannot be mistaken for it. */
     private fun attemptLog(): String = Log.since(paths.serverLog, logMark, 6 * 1024)
+
+    /** True when the current attempt's log shows the proot SIGSEGV the compatibility mode works around. */
+    fun crashedWithSegfault(): Boolean = ProotCommand.segfaultIn(attemptLog())
 
     /** True when the current attempt died because its port was already in use by something else on the phone. */
     fun portWasBusy(): Boolean {

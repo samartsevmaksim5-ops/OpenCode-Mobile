@@ -56,6 +56,14 @@ class Prefs(context: Context) {
         get() = sp.getBoolean("floating_menu", true)
         set(value) = sp.edit().putBoolean("floating_menu", value).apply()
 
+    /**
+     * Route the server's outbound traffic through the Cloudflare WARP tunnel. It only matters for the shared
+     * anonymous free-model limits, so the app keeps it off by default once a personal account is connected.
+     */
+    var warpEnabled: Boolean
+        get() = sp.getBoolean("warp_enabled", true)
+        set(value) = sp.edit().putBoolean("warp_enabled", value).apply()
+
     /** One-time prompts: true once [key] has been shown. */
     fun seen(key: String) = sp.getBoolean("seen_$key", false)
 

@@ -14,7 +14,7 @@ import android.widget.TextView
  * person closes it with the corner cross, a tap on the dark backdrop, or Back; it never comes back afterwards.
  */
 object UpdateBanner {
-    private const val SEEN_KEY = "update_105"
+    private const val SEEN_KEY = "update_106"
 
     /** Guards against a second copy stacking over the first one when the page reports being ready again. */
     private var active = false
@@ -47,7 +47,7 @@ object UpdateBanner {
         // Header: the title on the left, the cross on the right.
         val header = Ui.horizontal(activity)
         header.addView(
-            Ui.text(activity, tr("ЭКСТРЕННОЕ ОБНОВЛЕНИЕ 1.0.5", "EMERGENCY UPDATE 1.0.5"), 16f, palette.text, bold = true),
+            Ui.text(activity, tr("ОБНОВЛЕНИЕ 1.0.6", "UPDATE 1.0.6"), 16f, palette.text, bold = true),
             Ui.params(0, Ui.WRAP, weight = 1f),
         )
         header.addView(Ui.iconButton(activity, R.drawable.ic_close, tr("Закрыть", "Close"), palette, tint = palette.muted, sizeDp = 36) { dismiss() })
@@ -55,7 +55,7 @@ object UpdateBanner {
 
         // The announcement picture with corners rounded to match the card.
         val image = ImageView(activity).apply {
-            setImageResource(R.drawable.update_105)
+            setImageResource(R.drawable.update_106)
             adjustViewBounds = true
             clipToOutline = true
             outlineProvider = object : ViewOutlineProvider() {
@@ -63,16 +63,17 @@ object UpdateBanner {
                     outline.setRoundRect(0, 0, view.width, view.height, Ui.dp(activity, 14).toFloat())
                 }
             }
-            contentDescription = tr("Экстренное обновление 1.0.5", "Emergency update 1.0.5")
+            contentDescription = tr("Обновление 1.0.6", "Update 1.0.6")
         }
         card.addView(image, Ui.params(Ui.MATCH, Ui.WRAP, bottom = Ui.dp(activity, 12)))
 
         card.addView(Ui.text(activity, tr("Что изменено:", "What changed:"), 14f, palette.text, bold = true), Ui.params(bottom = Ui.dp(activity, 6)))
 
         for (line in listOf(
-            tr("- фикс критических ошибок", "- fixes for critical bugs"),
-            tr("- упрощение пользования", "- simpler to use"),
-            tr("- маленькие доработки", "- small improvements"),
+            tr("- добавлен Cloudflare WARP: запросы к моделям идут через чистый IP — общие лимиты бесплатных версий больше не помеха", "- Cloudflare WARP is here: model requests go through a clean IP - shared free-model limits no longer stop you"),
+            tr("- при упоре в лимит туннель сам пересоздаётся с новым IP — без ваших действий и без нового аккаунта", "- when a limit is hit the tunnel rebuilds itself with a fresh IP - no action from you, no new account needed"),
+            tr("- вход по Google больше не навязывается: экран входа никогда не открывается сам, только по вашему нажатию", "- Google sign-in is never pushed on you: the sign-in screen only opens when you tap it"),
+            tr("- исправлены падения «сервер постоянно падает»: проблемные устройства сами переключаются в совместимый режим", "- fixed the keeps crashing loop: affected devices switch to compatibility mode on their own"),
         )) {
             card.addView(Ui.text(activity, line, 14f, palette.muted), Ui.params(bottom = Ui.dp(activity, 3)))
         }

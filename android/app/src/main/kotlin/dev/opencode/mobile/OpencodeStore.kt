@@ -103,6 +103,25 @@ object OpencodeStore {
         if (root.remove(providerId) != null) writeJson(authFile(home), root)
     }
 
+    /**
+     * Signs the profile out of the Console: every credential that is not a plain API key (the OAuth session the
+     * device sign-in stored, in whatever shape the server version keeps it) is removed, while pasted connector keys
+     * survive. Without this the server keeps using the old account's quota even after the person creates a new one.
+     * Returns true when there was something to remove.
+     */
+    fun signOut(home: File): Boolean {
+        val root = readMap(authFile(home))
+        val drop = root.entries.filter { entry -> (entry.value as? Map<*, *>)?.get("type") != "api" }.map { it.key }
+
+        if (drop.isEmpty()) return false
+
+        for (id in drop) root.remove(id)
+
+        if (root.isEmpty()) authFile(home).delete() else writeJson(authFile(home), root)
+
+        return true
+    }
+
     fun mask(key: String): String {
         val trimmed = key.trim()
 

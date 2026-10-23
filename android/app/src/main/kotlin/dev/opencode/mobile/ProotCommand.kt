@@ -21,6 +21,8 @@ data class ProotConfig(
     val locale: String = "C.UTF-8",
     /** Host directory holding an over-the-air runtime build (`opencode` inside); null runs the bundled one. */
     val otaBinDir: String? = null,
+    /** Local HTTP proxy (the WARP tunnel) for the server's outbound traffic; null connects directly. */
+    val proxy: String? = null,
 )
 
 data class Launch(val command: List<String>, val env: Map<String, String>)
@@ -115,9 +117,27 @@ object ProotCommand {
             env["OPENCODE_FILEWATCHER_DISABLE"] = "1"
         }
 
+        // The WARP tunnel: everything the server sends to model providers leaves through Cloudflare. Local loopback
+        // traffic (the web UI to the server) must never touch the proxy, or the app would break without a tunnel.
+        if (!c.proxy.isNullOrEmpty()) {
+            for (key in listOf("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")) env[key] = c.proxy
+            for (key in listOf("NO_PROXY", "no_proxy")) env[key] = Warp.NO_PROXY
+        }
+
         env.putAll(extra)
 
         return env
+    }
+
+    /**
+     * True when the log shows the traced process died from SIGSEGV. proot prints "proot warning: signal 11 received
+     * from process -1" for it; on a number of devices the server cannot even start because of it, and the
+     * compatibility loader (PROOT_NO_SECCOMP=1) makes it go away - the service retries with that mode automatically.
+     */
+    fun segfaultIn(log: String): Boolean {
+        val lower = log.lowercase()
+
+        return "signal 11" in lower || "segmentation fault" in lower || "sigsegv" in lower
     }
 
     fun server(c: ProotConfig): Launch {

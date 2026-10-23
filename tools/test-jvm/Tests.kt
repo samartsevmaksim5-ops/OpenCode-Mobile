@@ -149,11 +149,12 @@ fun testTar(fixtures: File) {
     eq("sanitize root", TarGzExtractor.sanitize("/"), null)
 }
 
-fun cfg(compat: Boolean = false, ota: String? = null) = ProotConfig(
+fun cfg(compat: Boolean = false, ota: String? = null, proxy: String? = null) = ProotConfig(
     prootBin = "/data/app/lib/libproot.so", loader = "/data/app/lib/libproot-loader.so", nativeLibDir = "/data/app/lib",
     rootfs = "/data/files/rootfs", home = "/data/files/profiles/main/home", fakeProc = "/data/files/fakeproc",
     prootTmp = "/data/files/tmp", port = 4096, password = "s3cr\"et", bridgeUrl = "http://127.0.0.1:4090",
     bridgeToken = "tok", compat = compat, bindSharedStorage = true, timeZone = "Asia/Irkutsk", otaBinDir = ota,
+    proxy = proxy,
 )
 
 fun testFs() {
@@ -907,9 +908,153 @@ fun main(args: Array<String>) {
     testOtaPackage(fixtures)
     testGuestPaths()
     testOpencodeStore()
+    testWarp()
 
     println("passed: $passed, failed: ${failures.size}")
     failures.forEach { println("FAIL: $it") }
 
     if (failures.isNotEmpty()) System.exit(1)
+}
+
+// Cloudflare WARP: keys, registration, config generation, proxy environment.
+
+fun hex(text: String) = text.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+
+fun toHex(bytes: ByteArray) = bytes.joinToString("") { "%02x".format(it) }
+
+fun testWarp() {
+    // RFC 7748 section 5.2 test vectors for X25519.
+    eq(
+        "x25519 vector 1",
+        toHex(Warp.scalarMult(hex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4"), hex("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c"))),
+        "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552",
+    )
+    eq(
+        "x25519 vector 2",
+        toHex(Warp.scalarMult(hex("4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d"), hex("e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493"))),
+        "95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957",
+    )
+
+    // A key pair must agree as Diffie-Hellman: both sides derive the same shared secret.
+    val (privA, pubA) = Warp.keygen()
+    val (privB, pubB) = Warp.keygen()
+
+    // The Cloudflare API and wireproxy both want STANDARD base64 (44 chars with padding), not base64url.
+    eq("keygen b64 length", privA.length, 44)
+    eq("keygen b64 padding", privA.last(), '=')
+    eq("keygen raw size", Warp.b64Bytes(privA).size, 32)
+
+    eq(
+        "x25519 shared secret agrees",
+        toHex(Warp.scalarMult(Warp.b64Bytes(privA), Warp.b64Bytes(pubB))),
+        toHex(Warp.scalarMult(Warp.b64Bytes(privB), Warp.b64Bytes(pubA))),
+    )
+    eq("public key derives from private", toHex(Warp.publicKey(Warp.b64Bytes(privA))), toHex(Warp.b64Bytes(pubA)))
+
+    // The 6.x reply shape: the interface lives in config.client.interface, the endpoint host carries the port.
+    val reply = """
+        {"id":"warp-id-1","account_type":"free","config":{"client_id":"aGVsbG8","peers":[{"public_key":"bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=","endpoint":{"v4":"162.159.192.1:2408","v6":"[2606:4700:d0::a29f:c001]:2408","host":"162.159.192.1:2408"}}],"client":{"interface":{"addresses":{"v4":"172.16.0.2","v6":"2606:4700:110:8a5c:1a2b:3c4d:5e6f:7a8b/128"}}}},"key":"$pubA"}
+    """.trimIndent()
+
+    val account = Warp.parseRegistration(reply, privA)
+
+    eq("account id", account.id, "warp-id-1")
+    eq("account v4", account.addressV4, "172.16.0.2")
+    eq("account v6", account.addressV6, "2606:4700:110:8a5c:1a2b:3c4d:5e6f:7a8b/128")
+    eq("account peer", account.peerKey, "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=")
+    eq("account endpoint ip", account.endpoint, "162.159.192.1:2408")
+    eq("account key kept", account.privateKey, privA)
+
+    // The 7.x reply shape (captured from the live API): the interface moved to config.interface and every endpoint
+    // port is 0 - the real port comes from the host field and the ports list.
+    val reply7 = """
+        {"id":"warp-id-2","config":{"client_id":"EXIP","peers":[{"public_key":"bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=","endpoint":{"v4":"162.159.192.7:0","v6":"[2606:4700:d0::a29f:c007]:0","host":"162.159.192.7:0","ports":[2408,500,1701,4500]}}],"interface":{"addresses":{"v4":"172.16.0.2","v6":"2606:4700:110:8142:cdc7:6b3c:fa61:d29c"}}}}
+    """.trimIndent()
+
+    val account7 = Warp.parseRegistration(reply7, privA)
+
+    eq("7.x id", account7.id, "warp-id-2")
+    eq("7.x v4", account7.addressV4, "172.16.0.2")
+    eq("7.x v6", account7.addressV6, "2606:4700:110:8142:cdc7:6b3c:fa61:d29c")
+    eq("7.x endpoint port from list", account7.endpoint, "162.159.192.7:2408")
+
+    // An endpoint with no usable port anywhere still falls back to the default WARP port.
+    val replyNoPort = """
+        {"id":"warp-id-3","config":{"peers":[{"public_key":"bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=","endpoint":{"v4":"162.159.192.9:0"}}],"interface":{"addresses":{"v4":"172.16.0.3"}}}}
+    """.trimIndent()
+
+    eq("endpoint default port", Warp.parseRegistration(replyNoPort, privA).endpoint, "162.159.192.9:2408")
+
+    throws("broken reply refused") { Warp.parseRegistration("""{"config":{}}""", privA) }
+
+    // register() walks the client-version list until one works and sends the public key.
+    val seenBodies = ArrayList<String>()
+    val seenVersions = ArrayList<String>()
+    val seenAgents = ArrayList<String>()
+    val transport = object : Warp.Transport {
+        override fun post(url: String, body: String, headers: Map<String, String>): Warp.Reply {
+            seenBodies += body
+            seenVersions += headers.getValue("CF-Client-Version")
+            seenAgents += headers.getValue("User-Agent")
+
+            return if (headers.getValue("CF-Client-Version") == Warp.CLIENT_VERSIONS.first()) {
+                Warp.Reply(403, """{"message":"blocked"}""")
+            } else {
+                Warp.Reply(200, reply)
+            }
+        }
+    }
+
+    val registered = Warp.register(transport, privA, pubA)
+
+    eq("register walked to version 2", seenVersions, listOf(Warp.CLIENT_VERSIONS[0], Warp.CLIENT_VERSIONS[1]))
+    check("register payload has the public key", seenBodies[0].contains("\"key\":\"$pubA\""))
+    // Without the 1.1.1.1 app's User-Agent Cloudflare bans the request with 403 "error code: 1010".
+    check("register sends the app user agent", seenAgents.all { it == Warp.USER_AGENT })
+    eq("register result", registered.id, "warp-id-1")
+
+    // The wireproxy config carries both proxies and the endpoint as an IP literal; bare addresses gain prefixes.
+    val conf = Warp.conf(account)
+
+    check("conf private key", conf.contains("PrivateKey = $privA"))
+    check("conf addresses", conf.contains("Address = 172.16.0.2/32, 2606:4700:110:8a5c:1a2b:3c4d:5e6f:7a8b/128"))
+    check("conf endpoint", conf.contains("Endpoint = 162.159.192.1:2408"))
+    check("conf socks port", conf.contains("BindAddress = 127.0.0.1:${Warp.SOCKS_PORT}"))
+    check("conf http port", conf.contains("BindAddress = 127.0.0.1:${Warp.HTTP_PORT}"))
+    check("conf allowedips", conf.contains("AllowedIPs = 0.0.0.0/0, ::/0"))
+    check("conf bare v6 gains /128", Warp.conf(account7).contains("2606:4700:110:8142:cdc7:6b3c:fa61:d29c/128"))
+
+    // The account file survives a round trip.
+    val dir = Files.createTempDirectory("warp").toFile()
+
+    try {
+        val file = File(dir, "account.json")
+
+        Warp.saveAccount(file, account)
+        eq("account round trip", Warp.loadAccount(file), account)
+        eq("missing account is null", Warp.loadAccount(File(dir, "nope.json")), null)
+    } finally {
+        dir.deleteRecursively()
+    }
+
+    // The server environment points at the local tunnel and never proxies loopback traffic.
+    val proxied = ProotCommand.guestEnv(cfg(proxy = Warp.PROXY_URL))
+
+    eq("proxy env http", proxied["HTTP_PROXY"], Warp.PROXY_URL)
+    eq("proxy env https", proxied["HTTPS_PROXY"], Warp.PROXY_URL)
+    check("proxy env no_proxy", proxied["NO_PROXY"]?.contains("127.0.0.1") == true)
+    check("proxy env lowercase", proxied["http_proxy"] == Warp.PROXY_URL)
+
+    val direct = ProotCommand.guestEnv(cfg())
+
+    check("no proxy env without warp", direct.keys.none { it.equals("HTTP_PROXY", ignoreCase = true) })
+
+    // Segfault classification: proot's signal 11 line and lowercase variants, but not unrelated text.
+    check(
+        "segfault detected",
+        ProotCommand.segfaultIn("proot warning: signal 11 received from process -1") &&
+            ProotCommand.segfaultIn("Segmentation fault (core dumped)") &&
+            ProotCommand.segfaultIn("killed by SIGSEGV"),
+    )
+    check("no segfault in a clean log", !ProotCommand.segfaultIn("server listening on http://127.0.0.1:4099"))
 }

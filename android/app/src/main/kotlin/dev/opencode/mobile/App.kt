@@ -21,6 +21,9 @@ class App : Application() {
     lateinit var ota: OtaManager
         private set
 
+    lateinit var warp: WarpManager
+        private set
+
     private var started = 0
 
     /** True while any of the app's screens is visible. Notifications are only needed when it is not. */
@@ -50,6 +53,8 @@ class App : Application() {
         runtime = RuntimeInstaller(this, paths)
         Log.setStage("Application.onCreate: initializing OTA state")
         ota = OtaManager(this, paths, prefs)
+        Log.setStage("Application.onCreate: initializing WARP")
+        warp = WarpManager(paths, prefs)
         // A device with a broken notification service must still let the app open; startForeground failures are
         // handled where they happen.
         Log.setStage("Application.onCreate: initializing notifications")
@@ -88,7 +93,9 @@ class App : Application() {
                     try {
                         val accounts = ConsoleLogin(HttpTransport(snap.baseUrl, prefs.password)).signedInAccounts()
 
-                        profiles.setAccount(snap.profileId, accounts.firstOrNull()?.label)
+                        // Connections read oldest first; the newest one is whose tokens replaced auth.json, and that
+                        // is the account actually spending its quota.
+                        profiles.setAccount(snap.profileId, accounts.lastOrNull()?.label)
 
                         if (accounts.isNotEmpty()) prefs.signedIn = true
 

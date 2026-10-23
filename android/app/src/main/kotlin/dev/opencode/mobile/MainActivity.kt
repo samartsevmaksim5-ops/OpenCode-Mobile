@@ -110,7 +110,8 @@ class MainActivity : Activity(), UiHost {
         ServerService.send(this)
         unsubscribe = ServerState.listen { onState(it) }
 
-        if (!app.prefs.signedIn && !app.prefs.loginSkipped) startActivity(Intent(this, LoginActivity::class.java))
+        // Sign-in is never forced: no login screen pops up on its own, in any phase of the Linux setup. Google
+        // sign-in stays available in the menu, in settings, and from the quota offer in the chat.
         Log.setStage("Application active")
 
         // If Android refused to launch the crash screen while the previous process was dying, retry now that
@@ -196,10 +197,6 @@ class MainActivity : Activity(), UiHost {
             Phase.STOPPED -> startup.stopped()
             Phase.RUNNING -> {
                 origin = s.baseUrl
-
-                if (!app.prefs.signedIn && !app.prefs.loginSkipped) {
-                    startActivity(Intent(this, LoginActivity::class.java))
-                }
 
                 if (s.generation != loadedGeneration) {
                     loadedGeneration = s.generation

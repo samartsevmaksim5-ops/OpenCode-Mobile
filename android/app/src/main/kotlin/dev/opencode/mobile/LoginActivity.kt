@@ -442,7 +442,32 @@ class LoginActivity : Activity() {
         UiBus.reloadRequested = true
         app.syncAccountAsync()
         Ui.toast(this, if (adding) tr("Аккаунт добавлен", "Account added") else tr("Вход выполнен", "Signed in"))
+        reportConnectedAccount()
         finish()
+    }
+
+    /**
+     * After the browser approves the code the person still does not know WHICH account the server now spends quota
+     * from - the previous one could silently stay active. The connection label (the email) is fetched and shown, so
+     * the mismatch "created a new account, quota still gone" is visible immediately instead of a mystery.
+     */
+    private fun reportConnectedAccount() {
+        val s = ServerState.snapshot
+
+        if (s.phase != Phase.RUNNING) return
+
+        Thread({
+            runCatching {
+                Thread.sleep(1500)
+
+                val label = ConsoleLogin(HttpTransport(s.baseUrl, app.prefs.password)).signedInAccounts().lastOrNull()?.label
+                    ?: return@runCatching
+
+                runOnUiThread {
+                    Ui.toast(applicationContext, tr("Теперь активен аккаунт: ", "The active account is now: ") + label)
+                }
+            }
+        }, "login-report").apply { isDaemon = true; start() }
     }
 
     companion object {

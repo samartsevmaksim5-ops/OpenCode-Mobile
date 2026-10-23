@@ -56,6 +56,32 @@ class JsBridge(private val activity: MainActivity) {
         }
     }
 
+    /**
+     * The page hit a limit error: reconnect the WARP tunnel so Cloudflare hands out a different egress IP, which
+     * brings the shared anonymous free-model limits back. The result is reported as a toast.
+     */
+    @JavascriptInterface
+    fun rotateWarp() {
+        activity.runOnUiThread {
+            // Without a running tunnel (WARP off, or an account connected) there is nothing to refresh and the page
+            // just shows the sign-in offer as before.
+            if (!activity.app.warp.listening()) return@runOnUiThread
+
+            activity.app.warp.rotate("page limit error") { ok ->
+                activity.runOnUiThread {
+                    Ui.toast(
+                        activity,
+                        if (ok) {
+                            tr("WARP: IP обновлён, отправьте запрос ещё раз", "WARP: IP refreshed, send the request again")
+                        } else {
+                            tr("WARP не смог обновить IP", "WARP could not refresh the IP")
+                        },
+                    )
+                }
+            }
+        }
+    }
+
     @JavascriptInterface
     fun openExternal(url: String) {
         activity.runOnUiThread { activity.openExternal(url) }

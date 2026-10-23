@@ -22,6 +22,7 @@ class SettingsActivity : Activity() {
     private lateinit var column: LinearLayout
     private var unsubscribeState: (() -> Unit)? = null
     private var unsubscribeUpdates: (() -> Unit)? = null
+    private var unsubscribeWarp: (() -> Unit)? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -52,11 +53,13 @@ class SettingsActivity : Activity() {
         super.onStart()
         unsubscribeState = ServerState.listen { render() }
         unsubscribeUpdates = Updates.listen { render() }
+        unsubscribeWarp = app.warp.listen { render() }
     }
 
     override fun onStop() {
         unsubscribeState?.invoke()
         unsubscribeUpdates?.invoke()
+        unsubscribeWarp?.invoke()
         super.onStop()
     }
 
@@ -124,6 +127,7 @@ class SettingsActivity : Activity() {
         column.removeAllViews()
 
         profilesSection()
+        warpSection()
         extensionsSection()
         serverSection()
         updatesSection()
@@ -164,8 +168,8 @@ class SettingsActivity : Activity() {
                     Ui.text(
                         this,
                         tr(
-                            "Без своего аккаунта лимиты бесплатных моделей общие для всех, и их можно израсходовать. Подключите Gmail — квота станет вашей личной.",
-                            "Without your own account the free-model limits are shared by everyone and can run out. Connect Gmail to get a quota of your own.",
+                            "Без своего аккаунта лимиты бесплатных моделей общие для всех, и их можно израсходовать. Подключите Gmail — квота станет вашей личной. Аккаунт, созданный в браузере, начнёт работать только после входа в приложении; до тех пор выручает WARP.",
+                            "Without your own account the free-model limits are shared by everyone and can run out. Connect Gmail to get a quota of your own. An account created in a browser only works after signing in inside the app; until then WARP covers you.",
                         ),
                         12f,
                         palette.faint,
@@ -173,12 +177,142 @@ class SettingsActivity : Activity() {
                     Ui.params(bottom = Ui.dp(this, 8)),
                 )
             }
+            // The active profile's Console session is what decides whose quota the server spends. Signing out is the only
+            // way to stop using an exhausted account; a new account created anywhere else does nothing until this happens.
+            if (current) card.action(tr("Выйти из аккаунта", "Sign out of the account"), danger = true) { signOut() }
         }
 
         card.divide()
         card.action(tr("Добавить профиль", "Add a profile"), primary = true) { addProfile() }
         card.action(tr("Добавить ещё один аккаунт в этот профиль", "Add another account to this profile")) {
             startActivity(Intent(this, LoginActivity::class.java))
+        }
+    }
+
+    /** The Cloudflare WARP tunnel: a clean IP for the shared anonymous free-model limits, auto-rotated on a limit. */
+    private fun warpSection() {
+        val card = section(tr("Cloudflare WARP", "Cloudflare WARP"))
+        val status = app.warp.status
+
+        card.addView(
+            Ui.text(
+                this,
+                tr(
+                    "Без аккаунта лимиты бесплатных моделей общие по IP. WARP пускает запросы к моделям через Cloudflare с чистым адресом, а при упоре в лимит сам пересоздаёт туннель и меняет IP. С подключённым аккаунтом WARP не используется — квота и так личная.",
+                    "Without an account the free-model limits are shared per IP. WARP routes model requests through Cloudflare with a clean address and rebuilds the tunnel on its own when a limit is hit. With a connected account WARP stays idle - the quota is personal anyway.",
+                ),
+                12f,
+                palette.muted,
+            ),
+            Ui.params(bottom = Ui.dp(this, 8)),
+        )
+
+        card.toggle(
+            tr("Использовать WARP", "Use WARP"),
+            tr("Туннель поднимается вместе с сервером. Работает, только пока аккаунт не подключён.", "The tunnel starts with the server. It only runs while no account is connected."),
+            app.prefs.warpEnabled,
+        ) { value ->
+            app.prefs.warpEnabled = value
+
+            if (!value) app.warp.stop("turned off in settings")
+
+            render()
+        }
+
+        val label = when (status.phase) {
+            WarpManager.Phase.RUNNING -> tr("Туннель активен", "Tunnel active")
+            WarpManager.Phase.PREPARING -> tr("Поднимается...", "Coming up...")
+            WarpManager.Phase.FAILED -> tr("Ошибка", "Failed")
+            WarpManager.Phase.OFF ->
+                if (!app.prefs.warpEnabled) tr("Выключен", "Off") else tr("Поднимется при запуске сервера", "Will come up with the server")
+        }
+        val detail = when {
+            status.phase == WarpManager.Phase.FAILED && status.detail.isNotEmpty() -> "$label: ${status.detail}"
+            status.rotations > 0 -> "$label · ${tr("IP обновлён", "IP refreshed")} ×${status.rotations}"
+            else -> label
+        }
+
+        card.line(tr("Состояние", "State"), detail, state(detail, status.phase == WarpManager.Phase.RUNNING || status.phase == WarpManager.Phase.OFF))
+
+        card.divide()
+        card.action(tr("Обновить IP сейчас", "Refresh the IP now")) {
+            Ui.toast(this, tr("Пересоздаю туннель WARP...", "Rebuilding the WARP tunnel..."))
+            app.warp.rotate("manual refresh") { ok ->
+                runOnUiThread {
+                    Ui.toast(
+                        this,
+                        if (ok) tr("Готово: новый IP", "Done: a new IP") else tr("Не удалось, туннель поднимется с сервером", "Could not do it now; the tunnel will start with the server"),
+                    )
+                }
+            }
+        }
+        card.action(tr("Новая учётная запись WARP", "New WARP identity")) {
+            Ui.confirm(
+                this,
+                tr("Новая учётная запись WARP", "New WARP identity"),
+                tr(
+                    "Текущая регистрация WARP будет удалена и создана новая - с новым ключом и адресом. Продолжить?",
+                    "The current WARP registration is deleted and a new one is created - a new key and address. Continue?",
+                ),
+                tr("Создать", "Create"),
+            ) {
+                Ui.toast(this, tr("Регистрирую новую учётную запись...", "Registering a new identity..."))
+                app.warp.reRegister { ok ->
+                    runOnUiThread {
+                        Ui.toast(
+                            this,
+                            if (ok) tr("Новая учётная запись готова", "The new identity is ready") else tr("Не удалось зарегистрировать: проверьте интернет", "Registration failed: check the internet"),
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Disconnects the Console account the active profile is signed in with: the stored OAuth session is wiped from
+     * auth.json, the server restarts so no old token stays in memory, and the person is offered to sign in with a
+     * different account at once. Pasted API keys (connectors) are kept.
+     */
+    private fun signOut() {
+        val active = app.profiles.active
+        val who = active.account
+
+        Ui.confirm(
+            this,
+            tr("Выйти из аккаунта", "Sign out of the account"),
+            if (who == null) {
+                tr(
+                    "Сервер забудет сохранённый вход, и его квота перестанет действовать. Ключи коннекторов сохранятся, сервер перезапустится.",
+                    "The server will forget the stored sign-in and its quota will stop applying. Connector keys are kept, the server restarts.",
+                )
+            } else {
+                tr(
+                    "Аккаунт $who отключится: его квота и модели Zen перестанут работать. Ключи коннекторов сохранятся, сервер перезапустится.",
+                    "The account $who will be disconnected: its quota and Zen models stop working. Connector keys are kept, the server restarts.",
+                )
+            },
+            tr("Выйти", "Sign out"),
+        ) {
+            val home = Profiles.homeDir(app.paths.profilesDir, active)
+
+            Thread { runCatching { OpencodeStore.signOut(home) } }.apply { isDaemon = true }.start()
+            app.prefs.signedIn = false
+            app.profiles.setAccount(active.id, null)
+            app.prefs.loginSkipped = true
+            ServerService.send(this, ServerService.ACTION_RESTART)
+            Ui.toast(this, tr("Аккаунт отключён", "Account signed out"))
+            render()
+
+            Ui.confirm(
+                this,
+                tr("Войти другим аккаунтом", "Sign in with another account"),
+                tr(
+                    "Откроется вход через Google в чистом окне - войдите тем аккаунтом, чья квота нужна. Без этого приложение продолжит работать без квоты.",
+                    "Google sign-in opens in a clean window - sign in with the account whose quota you need. Otherwise the app keeps working without a quota.",
+                ),
+                tr("Войти", "Sign in"),
+            ) { startActivity(Intent(this, LoginActivity::class.java)) }
         }
     }
 
