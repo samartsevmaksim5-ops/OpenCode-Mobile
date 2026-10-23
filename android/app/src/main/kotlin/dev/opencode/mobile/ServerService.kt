@@ -376,7 +376,7 @@ class ServerService : Service() {
 
             app.syncAccountAsync()
             main.removeCallbacks(updateTick)
-            main.postDelayed(updateTick, 60_000)
+            main.post(updateTick)
         }
     }
 
