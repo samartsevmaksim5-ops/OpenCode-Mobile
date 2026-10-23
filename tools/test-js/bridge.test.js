@@ -32,6 +32,7 @@ function check(name, ok, detail) {
       setBars: (dark, color) => window.calls.push(["bars", dark, color]),
       terminalFocus: (f) => window.calls.push(["terminal", f]),
       copyText: (t) => window.calls.push(["copy", t]),
+      openLogin: () => window.calls.push(["login"]),
     };
   });
   await page.evaluate(bridge);
@@ -134,7 +135,30 @@ function check(name, ok, detail) {
   const copied = await page.evaluate(() => window.calls.filter((c) => c[0] === "copy").map((c) => c[1]));
   check("clipboard fallback", copied.includes("copied text"), JSON.stringify(copied));
 
-  // 8. Without the native interface the script does nothing and does not throw.
+  // 8. A bare quota error becomes an explanation about shared limits plus a button that opens the app's sign-in.
+  const quota = await page.evaluate(async (src) => {
+    window.__ocAndroidBridge = false;
+    (0, eval)(src);
+    const p = document.createElement("p");
+    p.textContent = "Error: insufficient quota";
+    document.body.appendChild(p);
+    await new Promise((r) => setTimeout(r, 900));
+    // The button goes inside the paragraph when the message block is the last element, next to it otherwise.
+    const button = p.querySelector("button") || p.nextElementSibling;
+    const callsBefore = window.calls.length;
+    if (button) button.click();
+    await new Promise((r) => setTimeout(r, 100));
+    return {
+      text: p.textContent,
+      buttonText: button && button.textContent,
+      opened: window.calls.slice(callsBefore).some((c) => c[0] === "login"),
+    };
+  }, bridge);
+  check("quota text replaced", quota.text.includes("\u043e\u0431\u0449\u0438\u0435") && quota.text.includes("Gmail"), JSON.stringify(quota));
+  check("quota button text", quota.buttonText === "\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u044c Gmail", String(quota.buttonText));
+  check("quota button opens sign-in", quota.opened === true);
+
+  // 9. Without the native interface the script does nothing and does not throw.
   const quiet = await context.newPage();
   await quiet.setContent("<html><body></body></html>");
   const threw = await quiet.evaluate((src) => { try { (0, eval)(src); return false; } catch (e) { return true; } }, bridge);

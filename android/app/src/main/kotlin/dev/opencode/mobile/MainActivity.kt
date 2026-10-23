@@ -153,6 +153,9 @@ class MainActivity : Activity(), UiHost {
 
         if (UiBus.host === this) UiBus.host = null
 
+        // The banner overlay died with this activity; let a fresh one show it again if it was never closed.
+        UpdateBanner.reset()
+
         previews.destroy()
         web.destroy()
         super.onDestroy()

@@ -9,14 +9,21 @@ import android.widget.ScrollView
 import android.widget.TextView
 
 /**
- * Signs in to the OpenCode Console (the account behind Zen and Go). The sign-in page opens in the system browser, where
- * the person picks Google and then the Google account, or adds another one. The screen keeps the attempt simple: one
- * button, an optional code, and it may be skipped entirely - signing in is never required to use the app.
+ * Signs in to the OpenCode Console (the account behind Zen and the free quota). The sign-in page opens in the system
+ * browser, where the person picks Google and then the Google account.
+ *
+ * The screen is deliberate about timing: the confirmation code is minted only when the person actually presses the
+ * button, and the button itself appears only once the Linux environment is unpacked and the server is running. A code
+ * minted earlier can expire while the environment is still preparing, and the console page then answers that it cannot
+ * verify it; a code minted on tap never has that problem. The same screen adds a second account to a profile that
+ * already has one - it opens the page in an ephemeral browser window, so Google asks which account to use instead of
+ * silently reusing the first one.
  */
 class LoginActivity : Activity() {
     private val app: App get() = application as App
     private lateinit var palette: Palette
     private lateinit var status: TextView
+    private lateinit var note: TextView
     private lateinit var codeBox: LinearLayout
     private lateinit var code: TextView
     private lateinit var buttons: LinearLayout
@@ -24,15 +31,26 @@ class LoginActivity : Activity() {
     private var unsubscribe: (() -> Unit)? = null
     private var attempt: LoginAttempt? = null
 
+    /** The server generation the live attempt was minted against; a newer generation makes the attempt stale. */
+    private var attemptGeneration = -1
+
+    /** Whether the live attempt's page was opened in an ephemeral window (the add-another-account path). */
+    private var attemptPrivate = false
+
+    /** True while a code is being minted, so a state update cannot start a second one. */
     @Volatile
-    private var alive = true
+    private var minting = false
 
     @Volatile
-    private var running = false
+    private var alive = true
 
     /** Bumped when the person asks for a retry so a sleeping backoff ends at once. */
     @Volatile
     private var wakeup = 0
+
+    /** True when the screen was opened to add another account to a profile that already has one. */
+    private val adding: Boolean
+        get() = app.prefs.signedIn || app.profiles.active.account != null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -45,12 +63,32 @@ class LoginActivity : Activity() {
         }
 
         column.addView(Ui.icon(this, R.drawable.ic_user, palette.muted, 40), Ui.params(Ui.dp(this, 40), Ui.dp(this, 40), bottom = Ui.dp(this, 14)))
-        column.addView(Ui.text(this, tr("Вход в OpenCode", "Sign in to OpenCode"), 22f, palette.text, bold = true), Ui.params(bottom = Ui.dp(this, 6)))
 
         column.addView(
             Ui.text(
                 this,
-                tr("Аккаунт открывает Zen и платные модели. Можно пропустить и войти позже в настройках.", "An account unlocks Zen and paid models. You can skip this and sign in later in settings."),
+                if (adding) tr("Добавить аккаунт", "Add an account") else tr("Вход в OpenCode", "Sign in to OpenCode"),
+                22f,
+                palette.text,
+                bold = true,
+            ),
+            Ui.params(bottom = Ui.dp(this, 6)),
+        )
+
+        column.addView(
+            Ui.text(
+                this,
+                if (adding) {
+                    tr(
+                        "У профиля уже есть аккаунт. Добавьте ещё один - Google спросит, каким войти.",
+                        "This profile already has an account. Add another one - Google will ask which to use.",
+                    )
+                } else {
+                    tr(
+                        "Аккаунт даёт вашу личную квоту бесплатных моделей, а также Zen и платные модели. Можно пропустить и войти позже в настройках.",
+                        "An account brings your own free-model quota, plus Zen and paid models. You can skip this and sign in later in settings.",
+                    )
+                },
                 14f,
                 palette.muted,
             ).apply { gravity = Gravity.CENTER_HORIZONTAL },
@@ -64,8 +102,14 @@ class LoginActivity : Activity() {
         codeBox.addView(Ui.text(this, tr("Если страница спросит код, он совпадает с этим.", "If the page asks for a code, it is this one."), 12f, palette.muted))
         column.addView(codeBox, Ui.params(Ui.MATCH, Ui.WRAP, bottom = Ui.dp(this, 16)))
 
-        status = Ui.text(this, tr("Готов к входу", "Ready"), 14f, palette.muted).apply { gravity = Gravity.CENTER_HORIZONTAL }
-        column.addView(status, Ui.params(bottom = Ui.dp(this, 16)))
+        status = Ui.text(this, tr("Готовим Linux-окружение...", "Preparing the Linux environment..."), 14f, palette.muted).apply { gravity = Gravity.CENTER_HORIZONTAL }
+        column.addView(status, Ui.params(bottom = Ui.dp(this, 6)))
+
+        note = Ui.text(this, "", 13f, palette.faint).apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+            visibility = View.GONE
+        }
+        column.addView(note, Ui.params(bottom = Ui.dp(this, 10)))
 
         buttons = Ui.vertical(this)
         column.addView(buttons, Ui.params(Ui.MATCH, Ui.WRAP))
@@ -79,7 +123,9 @@ class LoginActivity : Activity() {
         window.statusBarColor = palette.bg
         window.navigationBarColor = palette.bg
 
-        showButtons()
+        // The start button waits for the server on purpose: until Linux is unpacked and the server runs, a minted code
+        // can go stale before the browser even opens, and the console page then refuses to verify it.
+        showWaiting()
         ServerService.send(this)
         unsubscribe = ServerState.listen { onState(it) }
     }
@@ -94,29 +140,153 @@ class LoginActivity : Activity() {
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         // Closing the screen is allowed; the app simply works without an account.
-        if (attempt == null) {
+        if (attempt == null && !minting && !adding) {
             app.prefs.loginSkipped = true
             finish()
         } else {
-            moveTaskToBack(true)
+            finish()
         }
     }
 
     private fun onState(s: Snapshot) {
+        // The listener runs on the main thread; nothing here may begin a second mint while one is in flight.
         when (s.phase) {
-            Phase.RUNNING -> if (!running && attempt == null) begin(s)
-            Phase.FAILED -> {
-                status.text = tr("Сервер не запустился: ", "The server did not start: ") + s.error.orEmpty()
-                showButtons(retry = true)
+            Phase.RUNNING -> if (attempt == null && !minting) {
+                status.text = tr("Готово к входу", "Ready")
+                showStartButtons()
             }
-            else -> if (attempt == null && !running) status.text = if (s.message.isNotEmpty()) s.message else tr("Ожидание сервера...", "Waiting for the server...")
+
+            Phase.FAILED -> {
+                if (attempt == null && !minting) {
+                    status.text = tr("Сервер не запустился: ", "The server did not start: ") + s.error.orEmpty()
+                    showServerRetry()
+                }
+            }
+
+            else -> if (attempt == null && !minting) showWaiting(s)
+        }
+
+        // A server restart throws away the attempt the console page is verifying against; start over.
+        if (attempt != null && s.phase == Phase.RUNNING && s.generation != attemptGeneration) {
+            attempt = null
+            hideNote()
+            status.text = tr(
+                "Сервер перезапустился. Код со старой страницы больше не действует - начните вход заново.",
+                "The server restarted. The code on the old page no longer works - start the sign-in again.",
+            )
+            showStartButtons()
         }
     }
 
-    private fun begin(s: Snapshot) {
-        running = true
+    /** The screen before the server is up: progress text and the way out, no code minting yet. */
+    private fun showWaiting(s: Snapshot = ServerState.snapshot) {
+        buttons.removeAllViews()
+
+        if (attempt == null && !minting && s.phase != Phase.RUNNING && s.phase != Phase.FAILED) {
+            status.text = if (s.message.isNotEmpty()) s.message else tr("Готовим Linux-окружение...", "Preparing the Linux environment...")
+        }
+
+        addSkip()
+    }
+
+    /** The server is running: the sign-in button appears, and pressing it mints a fresh code. */
+    private fun showStartButtons() {
+        buttons.removeAllViews()
+
+        buttons.addView(
+            Ui.button(
+                this,
+                if (adding) tr("Добавить аккаунт Google", "Add a Google account") else tr("Войти через Google", "Sign in with Google"),
+                palette,
+                primary = true,
+            ) {
+                val s = ServerState.snapshot
+
+                if (s.phase == Phase.RUNNING) begin(s, private = adding) else ServerService.send(this, ServerService.ACTION_START)
+            },
+            Ui.params(bottom = Ui.dp(this, 8)),
+        )
+
+        addSkip()
+    }
+
+    /** Start failed or the attempt expired: retry (and restart the server when it is down) plus the way out. */
+    private fun showServerRetry() {
+        buttons.removeAllViews()
+
+        buttons.addView(
+            Ui.button(this, tr("Повторить", "Try again"), palette, primary = true) {
+                attempt = null
+                hideNote()
+
+                val s = ServerState.snapshot
+
+                if (s.phase == Phase.RUNNING) begin(s, private = adding) else ServerService.send(this, ServerService.ACTION_RESTART)
+            },
+            Ui.params(bottom = Ui.dp(this, 8)),
+        )
+
+        addSkip()
+    }
+
+    /** Buttons while the browser page is waiting for the person to approve the code. */
+    private fun showAttemptButtons() {
+        val current = attempt ?: return
+        buttons.removeAllViews()
+
+        buttons.addView(
+            Ui.button(this, tr("Открыть страницу входа", "Open the sign-in page"), palette, primary = true) {
+                Browser.open(this, current.url, private = attemptPrivate)
+            },
+            Ui.params(bottom = Ui.dp(this, 8)),
+        )
+
+        // The console page refuses a code when it went stale (a restart, a long Google sign-in, an old tab). A fresh
+        // code always fixes it, so the way to get one stays one tap away.
+        buttons.addView(
+            Ui.button(this, tr("Выдать новый код", "Issue a new code"), palette) {
+                attempt = null
+                hideNote()
+
+                val s = ServerState.snapshot
+
+                if (s.phase == Phase.RUNNING) begin(s, private = attemptPrivate) else ServerService.send(this, ServerService.ACTION_RESTART)
+            },
+            Ui.params(bottom = Ui.dp(this, 8)),
+        )
+
+        if (!attemptPrivate) {
+            buttons.addView(
+                Ui.button(this, tr("Другой аккаунт", "Another account"), palette) { Browser.open(this, current.url, private = true) },
+                Ui.params(bottom = Ui.dp(this, 8)),
+            )
+        }
+
+        addSkip()
+    }
+
+    /** Skip stays available until a sign-in completes; in the add-another mode it simply closes the screen. */
+    private fun addSkip() {
+        buttons.addView(
+            Ui.button(this, if (adding) tr("Готово", "Done") else tr("Пропустить", "Skip"), palette) {
+                if (!adding) app.prefs.loginSkipped = true
+                alive = false
+                wakeup++
+                finish()
+            },
+            Ui.params(bottom = Ui.dp(this, 8)),
+        )
+
+        buttons.gravity = Gravity.CENTER_HORIZONTAL
+    }
+
+    private fun begin(s: Snapshot, private: Boolean) {
+        minting = true
+        attemptPrivate = private
+        hideNote()
         status.text = tr("Запрашиваю страницу входа...", "Requesting the sign-in page...")
-        showButtons()
+        buttons.removeAllViews()
+        addSkip()
 
         val login = ConsoleLogin(HttpTransport(s.baseUrl, app.prefs.password))
 
@@ -128,26 +298,29 @@ class LoginActivity : Activity() {
             // launch work without the person ever seeing the failure.
             for (n in 1..ATTEMPTS) {
                 if (!alive) {
-                    running = false
+                    minting = false
 
                     return@Thread
                 }
 
                 try {
                     val started = login.start()
+                    val mintedAt = System.currentTimeMillis()
 
                     runOnUiThread {
                         if (!alive) return@runOnUiThread
 
+                        minting = false
                         attempt = started
+                        attemptGeneration = s.generation
                         code.text = started.code.orEmpty()
                         codeBox.visibility = if (started.code != null) View.VISIBLE else View.GONE
                         status.text = tr("Ждём, пока вы войдёте в браузере...", "Waiting for you to sign in in the browser...")
-                        showButtons()
-                        Browser.open(this, started.url)
+                        showAttemptButtons()
+                        Browser.open(this, started.url, private = private)
                     }
 
-                    poll(login, started)
+                    poll(login, started, mintedAt)
 
                     return@Thread
                 } catch (e: Exception) {
@@ -166,8 +339,11 @@ class LoginActivity : Activity() {
             runOnUiThread {
                 if (!alive) return@runOnUiThread
 
+                minting = false
+                attempt = null
+                codeBox.visibility = View.GONE
                 status.text = tr("Не удалось начать вход: ", "Could not start the sign-in: ") + LoginFault.friendly(lastError ?: "")
-                showButtons(retry = true)
+                showServerRetry()
             }
         }, "login").apply { isDaemon = true; start() }
     }
@@ -184,12 +360,27 @@ class LoginActivity : Activity() {
         }
     }
 
-    private fun poll(login: ConsoleLogin, started: LoginAttempt) {
+    private fun poll(login: ConsoleLogin, started: LoginAttempt, mintedAt: Long) {
         var errors = 0
+        var hinted = false
 
         while (alive) {
             try {
                 Thread.sleep(2000)
+
+                if (!hinted && System.currentTimeMillis() - mintedAt > HINT_AFTER_MS) {
+                    hinted = true
+
+                    runOnUiThread {
+                        if (!alive || attempt == null) return@runOnUiThread
+
+                        note.text = tr(
+                            "Если страница пишет, что код не подтверждается, нажмите «Выдать новый код» и откройте её заново.",
+                            "If the page says the code cannot be verified, tap \"Issue a new code\" and open it again.",
+                        )
+                        note.visibility = View.VISIBLE
+                    }
+                }
 
                 when (val result = login.status(started)) {
                     LoginStatus.Complete -> {
@@ -201,8 +392,9 @@ class LoginActivity : Activity() {
                         runOnUiThread {
                             attempt = null
                             codeBox.visibility = View.GONE
+                            hideNote()
                             status.text = tr("Время входа истекло. Начните заново.", "The sign-in timed out. Start again.")
-                            showButtons(retry = true)
+                            showServerRetry()
                         }
 
                         return
@@ -211,12 +403,13 @@ class LoginActivity : Activity() {
                         runOnUiThread {
                             attempt = null
                             codeBox.visibility = View.GONE
+                            hideNote()
                             status.text = if (result.message.contains("access_denied")) {
                                 tr("Вход отклонён на странице.", "The sign-in was declined on the page.")
                             } else {
                                 tr("Вход не удался: ", "Sign-in failed: ") + result.message
                             }
-                            showButtons(retry = true)
+                            showServerRetry()
                         }
 
                         return
@@ -231,7 +424,7 @@ class LoginActivity : Activity() {
                     runOnUiThread {
                         attempt = null
                         status.text = tr("Потеряна связь с сервером: ", "Lost the connection to the server: ") + (e.message ?: "")
-                        showButtons(retry = true)
+                        showServerRetry()
                     }
 
                     return
@@ -240,71 +433,22 @@ class LoginActivity : Activity() {
         }
     }
 
+    private fun hideNote() {
+        note.visibility = View.GONE
+    }
+
     private fun done() {
         app.prefs.signedIn = true
         UiBus.reloadRequested = true
         app.syncAccountAsync()
-        Ui.toast(this, tr("Вход выполнен", "Signed in"))
+        Ui.toast(this, if (adding) tr("Аккаунт добавлен", "Account added") else tr("Вход выполнен", "Signed in"))
         finish()
-    }
-
-    private fun showButtons(retry: Boolean = false) {
-        buttons.removeAllViews()
-
-        val current = attempt
-
-        if (retry) {
-            buttons.addView(
-                Ui.button(this, tr("Повторить", "Try again"), palette, primary = true) {
-                    attempt = null
-
-                    val s = ServerState.snapshot
-
-                    if (s.phase == Phase.RUNNING) begin(s) else ServerService.send(this, ServerService.ACTION_RESTART)
-                },
-                Ui.params(bottom = Ui.dp(this, 8)),
-            )
-        }
-
-        if (current != null) {
-            buttons.addView(
-                Ui.button(this, tr("Открыть страницу входа", "Open the sign-in page"), palette, primary = true) { Browser.open(this, current.url) },
-                Ui.params(bottom = Ui.dp(this, 8)),
-            )
-            buttons.addView(
-                Ui.button(this, tr("Другой аккаунт", "Another account"), palette) { Browser.open(this, current.url, private = true) },
-                Ui.params(bottom = Ui.dp(this, 8)),
-            )
-        } else if (!running) {
-            buttons.addView(
-                Ui.button(this, tr("Войти через Google", "Sign in with Google"), palette, primary = true) {
-                    attempt = null
-
-                    val s = ServerState.snapshot
-
-                    if (s.phase == Phase.RUNNING) begin(s) else ServerService.send(this, ServerService.ACTION_START)
-                },
-                Ui.params(bottom = Ui.dp(this, 8)),
-            )
-        }
-
-        // The skip button stays until a sign-in is actually in flight, so the first launch can always be passed over.
-        if (current == null) {
-            buttons.addView(
-                Ui.button(this, tr("Пропустить", "Skip"), palette) {
-                    app.prefs.loginSkipped = true
-                    alive = false
-                    wakeup++
-                    finish()
-                },
-                Ui.params(bottom = Ui.dp(this, 8)),
-            )
-        }
-
-        buttons.gravity = Gravity.CENTER_HORIZONTAL
     }
 
     companion object {
         private const val ATTEMPTS = 4
+
+        /** How long a pending attempt waits before the screen offers the way out of a refusing page. */
+        private const val HINT_AFTER_MS = 4 * 60 * 1000L
     }
 }

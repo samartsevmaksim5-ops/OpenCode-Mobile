@@ -156,6 +156,23 @@ class SettingsActivity : Activity() {
             card.line(profile.title, if (profile.account != null) profile.name else tr("Аккаунт не подключён", "No account connected"), badge) {
                 profileMenu(profile)
             }
+
+            // A profile without an account rides the shared anonymous pool: one heavy user anywhere drains it for
+            // everyone. The way out is a personal account, so say so right where the empty state is.
+            if (current && profile.account == null) {
+                card.addView(
+                    Ui.text(
+                        this,
+                        tr(
+                            "Без своего аккаунта лимиты бесплатных моделей общие для всех, и их можно израсходовать. Подключите Gmail — квота станет вашей личной.",
+                            "Without your own account the free-model limits are shared by everyone and can run out. Connect Gmail to get a quota of your own.",
+                        ),
+                        12f,
+                        palette.faint,
+                    ),
+                    Ui.params(bottom = Ui.dp(this, 8)),
+                )
+            }
         }
 
         card.divide()

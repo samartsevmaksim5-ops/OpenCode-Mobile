@@ -16,19 +16,29 @@ import android.widget.TextView
 object UpdateBanner {
     private const val SEEN_KEY = "update_105"
 
-    fun shouldShow(activity: MainActivity): Boolean = !activity.app.prefs.seen(SEEN_KEY)
+    /** Guards against a second copy stacking over the first one when the page reports being ready again. */
+    private var active = false
+
+    fun shouldShow(activity: MainActivity): Boolean = !active && !activity.app.prefs.seen(SEEN_KEY)
 
     /** Builds the overlay over everything else; [close] runs when it goes away for any reason. */
     fun show(activity: MainActivity, close: () -> Unit) {
+        if (active) return
+
+        active = true
+
         val palette = activity.palette
-        val scrim = FrameLayout(activity).apply { setBackgroundColor(palette.scrim) }
+        val scrim = FrameLayout(activity).apply {
+            setBackgroundColor(palette.scrim)
+            tag = SCRIM_TAG
+        }
         val card = Ui.vertical(activity).apply {
             background = Ui.rounded(activity, palette.bg, 20f, palette.border)
             setPadding(Ui.dp(activity, 16), Ui.dp(activity, 12), Ui.dp(activity, 16), Ui.dp(activity, 18))
         }
-        val box = FrameLayout(activity)
 
         fun dismiss() {
+            active = false
             activity.app.prefs.markSeen(SEEN_KEY)
             (scrim.parent as? FrameLayout)?.removeView(scrim)
             close()
@@ -87,4 +97,11 @@ object UpdateBanner {
             FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT),
         )
     }
+
+    /** A leftover banner from a rebuilt page never survives a new instance of the activity. */
+    fun reset() {
+        active = false
+    }
+
+    private const val SCRIM_TAG = "update_banner_scrim"
 }
