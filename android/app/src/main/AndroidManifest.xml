@@ -62,6 +62,21 @@
             android:exported="false"
             android:launchMode="singleTop" />
 
+        <activity
+            android:name=".ConnectorsActivity"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize" />
+
+        <activity
+            android:name=".PluginsActivity"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize" />
+
+        <activity
+            android:name=".RulesActivity"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize" />
+
         <!-- Shows the reason when the app dies. Its own process, so it opens even if the main one cannot start. -->
         <activity
             android:name=".CrashActivity"

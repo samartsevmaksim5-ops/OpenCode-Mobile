@@ -59,6 +59,66 @@ data class ConsoleAccount(val id: String, val label: String, val method: String)
 class LoginException(message: String) : Exception(message)
 
 /**
+ * Decides whether a failed sign-in start is worth trying again. Right after the server comes up its outbound network
+ * is often not warm yet, so the first attempt can end in a transport error even when the phone is online; a short
+ * retry loop turns that into a working first launch. Wrong replies from the local server are not retried.
+ */
+object LoginFault {
+    private val serverDown = listOf(
+        "transport error",
+        "fetch failed",
+        "network",
+        "unreachable",
+        "timed out",
+        "timeout",
+        "econnrefused",
+        "econnreset",
+        "enotfound",
+        "eai_again",
+        "ehostunreach",
+        "enetunreach",
+        "socket hang up",
+        "interrupted",
+        "connection refused",
+        "connection reset",
+        "unable to resolve host",
+    )
+
+    fun isRetryable(message: String?): Boolean {
+        val text = message?.lowercase() ?: return false
+
+        if (serverDown.any { it in text }) return true
+
+        return Regex("http 5\\d\\d").containsMatchIn(text)
+    }
+
+    /** A short human explanation the login screen can show instead of the raw server text. */
+    fun friendly(message: String): String {
+        val text = message.lowercase()
+
+        return when {
+            "transport error" in text || "fetch failed" in text || "enotfound" in text || "eai_again" in text -> tr(
+                "Сервер не смог связаться с opencode.ai. Проверьте интернет на телефоне; обычно помогает новая попытка.",
+                "The server could not reach opencode.ai. Check the phone's internet; another try usually helps.",
+            )
+            "timed out" in text || "timeout" in text -> tr(
+                "opencode.ai не ответил вовремя. Проверьте интернет и попробуйте ещё раз.",
+                "opencode.ai did not answer in time. Check the internet and try again.",
+            )
+            "method" in text && "sign-in" in text || "no account sign-in" in text -> tr(
+                "Сервер не сообщил способ входа. Перезапустите сервер в настройках и попробуйте снова.",
+                "The server did not report a sign-in method. Restart the server in settings and try again.",
+            )
+            "integration" in text -> tr(
+                "Сервер ответил нестандартно на запрос входа. Попробуйте ещё раз или перезапустите сервер.",
+                "The server replied unexpectedly to the sign-in request. Try again or restart the server.",
+            )
+            else -> message
+        }
+    }
+}
+
+/**
  * Starts and follows the OpenCode Console sign-in (the account behind Zen and Go) using the same server API the web
  * UI uses. The page that gets opened lets the person pick Google or GitHub, and Google shows its account chooser.
  */

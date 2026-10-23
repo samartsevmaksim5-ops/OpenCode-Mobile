@@ -247,4 +247,89 @@
     '@media (max-width: 767px) { [data-slot="composer-controls"] [class*="max-w-[220px]"] { max-width: 148px !important; } }';
 
   (document.head || document.documentElement).appendChild(composerStyle);
+
+  // A person without a connected account hits a bare quota error as soon as the free models run out. Replace that
+  // dead end with an offer to sign in, plus a button that opens the app's own sign-in screen.
+  var QUOTA = /(insufficient[_ ]?quota|quota\s*(?:exceeded|exhausted|has been exceeded|will run out|is exhausted)|exceeded\s*(?:your|the|its)?\s*(?:usage|quota|free)|(?:free|usage|request)\s*(?:quota|limit)|(?:credit|credits?|tokens?)\s*(?:exhausted|used up)|\u043a\u0432\u043e\u0442[\u0430\u044b\u0443]?\s*(?:\u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d\u0430|\u0437\u0430\u043a\u043e\u043d\u0447\u0438\u043b\u0430\u0441\u044c|\u043f\u0440\u0435\u0432\u044b\u0448\u0435\u043d\u0430)|(?:\u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d|\u0437\u0430\u043a\u043e\u043d\u0447\u0438\u043b\u0430\u0441\u044c)\s*(?:\u043b\u0438\u043c\u0438\u0442|\u043a\u0432\u043e\u0442\u0430)|\u043b\u0438\u043c\u0438\u0442\s*(?:\u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d|\u043f\u0440\u0435\u0432\u044b\u0448\u0435\u043d|\u0437\u0430\u043a\u043e\u043d\u0447\u0438\u043b\u0441\u044f))/i;
+  var quotaHandled = new WeakSet();
+
+  function makeSignInButton() {
+    var button = document.createElement("button");
+
+    button.type = "button";
+    button.textContent = "\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u044c";
+    button.style.cssText =
+      "display:inline-block;margin:10px 0 2px;padding:10px 22px;border:0;border-radius:12px;" +
+      "background:#161616;color:#fafafa;font-size:14px;font-weight:600;font-family:inherit;cursor:pointer";
+
+    button.addEventListener(
+      "click",
+      function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+
+        try {
+          native.openLogin();
+        } catch (e) {}
+      },
+      true,
+    );
+
+    return button;
+  }
+
+  function offerSignIn(node) {
+    var text = node.nodeValue || "";
+
+    if (!text || text.length > 400 || !QUOTA.test(text)) return;
+
+    var parent = node.parentElement;
+
+    if (!parent || quotaHandled.has(parent)) return;
+
+    quotaHandled.add(parent);
+    node.nodeValue =
+      "\u041a\u0432\u043e\u0442\u0430 \u0431\u0435\u0441\u043f\u043b\u0430\u0442\u043d\u044b\u0445 \u043c\u043e\u0434\u0435\u043b\u0435\u0439 \u0437\u0430\u043a\u043e\u043d\u0447\u0438\u043b\u0430\u0441\u044c. " +
+      "\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u0435 Gmail (\u0430\u043a\u043a\u0430\u0443\u043d\u0442 OpenCode), \u0447\u0442\u043e\u0431\u044b \u043f\u0440\u043e\u0434\u043e\u043b\u0436\u0438\u0442\u044c.";
+
+    var button = makeSignInButton();
+
+    if (parent.nextElementSibling === null) {
+      parent.appendChild(button);
+    } else {
+      parent.insertBefore(button, parent.nextSibling);
+    }
+  }
+
+  function scanQuota(root) {
+    if (!root) return;
+
+    try {
+      var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+      var current = walker.currentNode;
+      var guard = 0;
+
+      while (current && guard < 4000) {
+        guard++;
+        offerSignIn(current);
+        current = walker.nextNode();
+      }
+    } catch (e) {}
+  }
+
+  var quotaTimer = 0;
+
+  function scheduleQuota() {
+    clearTimeout(quotaTimer);
+    quotaTimer = setTimeout(function () {
+      scanQuota(document.body);
+    }, 300);
+  }
+
+  new MutationObserver(scheduleQuota).observe(document.body || document.documentElement, {
+    childList: true,
+    subtree: true,
+    characterData: true,
+  });
+  scheduleQuota();
 })();

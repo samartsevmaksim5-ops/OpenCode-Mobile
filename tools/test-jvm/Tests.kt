@@ -760,6 +760,133 @@ fun testGuestPaths() {
     }
 }
 
+fun testMiniJsonWrite() {
+    eq(
+        "write mixed",
+        MiniJson.write(linkedMapOf<String, Any?>("a" to 1L, "b" to "x\"y", "c" to listOf(true, null, 2.5), "d" to linkedMapOf<String, Any?>("e" to "текст"))),
+        """{"a":1,"b":"x\"y","c":[true,null,2.5],"d":{"e":"текст"}}""",
+    )
+    eq("write int", MiniJson.write(42), "42")
+    eq("write bool", MiniJson.write(false), "false")
+    eq("write null", MiniJson.write(null), "null")
+    eq("write double whole", MiniJson.write(3.0), "3")
+    eq("write roundtrip", MiniJson.parse(MiniJson.write(MiniJson.parse("""{"x":[1,{"y":"z"}]}"""))), MiniJson.parse("""{"x":[1,{"y":"z"}]}"""))
+}
+
+fun testLoginFault() {
+    check("transport error retries", LoginFault.isRetryable("Transport error (POST https://opencode.ai/console/auth/device/code)"))
+    check("http 502 retries", LoginFault.isRetryable("HTTP 502"))
+    check("dns retries", LoginFault.isRetryable("Unable to resolve host \"opencode.ai\""))
+    check("timeout retries", LoginFault.isRetryable("connect timed out"))
+    check("method mismatch does not retry", !LoginFault.isRetryable("The server has no account sign-in method"))
+    check("http 404 does not retry", !LoginFault.isRetryable("HTTP 404"))
+    check("empty does not retry", !LoginFault.isRetryable(""))
+    check("null does not retry", !LoginFault.isRetryable(null))
+    check("friendly transport", LoginFault.friendly("Transport error (POST https://opencode.ai/console/auth/device/code)").contains("opencode.ai"))
+    eq("friendly passthrough", LoginFault.friendly("HTTP 401"), "HTTP 401")
+}
+
+fun testOpencodeStore() {
+    val base = Files.createTempDirectory("store").toFile()
+
+    try {
+        val home = File(base, "home").apply { mkdirs() }
+
+        // Plugin file names
+        eq("name plain", OpencodeStore.pluginFileName("my.js"), "my.js")
+        eq("name ts kept", OpencodeStore.pluginFileName("tool.ts"), "tool.ts")
+        eq("name adds js", OpencodeStore.pluginFileName("plugin"), "plugin.js")
+        eq("name strips path", OpencodeStore.pluginFileName("/etc/passwd"), "passwd.js")
+        eq("name cleans", OpencodeStore.pluginFileName("my plugin!.js"), "my_plugin_.js")
+        eq("name mjs", OpencodeStore.pluginFileName("a.mjs"), "a.mjs")
+
+        // Install from bytes, list, delete
+        val installed = OpencodeStore.installPluginBytes(home, "export const P = 1".toByteArray(), "nice plugin.js")
+
+        eq("installed name", installed.name, "nice_plugin.js")
+        check("installed exists", installed.exists())
+        eq("listed", OpencodeStore.localPlugins(home).map { it.name }, listOf(installed.name))
+        check("delete works", OpencodeStore.deletePlugin(home, installed))
+
+        // A HTML page is refused as a plugin
+        check("html is not a script", !OpencodeStore.looksLikeScript("x.js", "<!doctype html><html></html>".toByteArray()))
+        check("script passes", OpencodeStore.looksLikeScript("x.js", "export const x = 1".toByteArray()))
+
+        // Provider keys in auth.json
+        OpencodeStore.setProviderKey(home, "anthropic", "sk-ant-0123456789abcdef")
+        eq("key saved", OpencodeStore.connectedKeys(home)["anthropic"], "sk-ant...cdef")
+        check("raw key on disk", OpencodeStore.authFile(home).readText().contains("sk-ant-0123456789abcdef"))
+        eq("key masked", OpencodeStore.mask("sk-ant-0123456789abcdef"), "sk-ant...cdef")
+        OpencodeStore.clearProviderKey(home, "anthropic")
+        check("key cleared", OpencodeStore.connectedKeys(home).isEmpty())
+
+        // Custom providers in the config
+        OpencodeStore.addCustomProvider(
+            home,
+            CustomProvider("myapi", "My API", "https://api.example.com/v1", "sk-custom-1234567890", listOf("glm-4.6" to "GLM 4.6")),
+        )
+
+        val providers = OpencodeStore.customProviders(home)
+
+        eq("provider listed", providers.map { it.id }, listOf("myapi"))
+        eq("provider base", providers.first().baseUrl, "https://api.example.com/v1")
+        eq("provider models", providers.first().models, listOf("glm-4.6" to "GLM 4.6"))
+        eq("provider key also in auth", OpencodeStore.connectedKeys(home)["myapi"], "sk-cus...7890")
+        eq("provider npm untouched", OpencodeStore.npmPlugins(home), emptyList())
+
+        OpencodeStore.setDefaultModel(home, "myapi", "glm-4.6")
+        eq("default model", OpencodeStore.defaultModel(home), "myapi/glm-4.6")
+
+        OpencodeStore.removeCustomProvider(home, "myapi")
+        check("provider removed", OpencodeStore.customProviders(home).isEmpty())
+        eq("default model cleaned", OpencodeStore.defaultModel(home), null)
+        check("auth entry removed", OpencodeStore.connectedKeys(home).isEmpty())
+
+        // npm plugins
+        OpencodeStore.addNpmPlugin(home, "opencode-example-plugin")
+        OpencodeStore.addNpmPlugin(home, "opencode-example-plugin")
+        eq("npm plugin once", OpencodeStore.npmPlugins(home), listOf("opencode-example-plugin"))
+        OpencodeStore.removeNpmPlugin(home, "opencode-example-plugin")
+        check("npm plugin removed", OpencodeStore.npmPlugins(home).isEmpty())
+
+        // Rules: a global one and ones for specific models
+        OpencodeStore.saveRule(home, null, "Global style", null, "Be brief.\n")
+        OpencodeStore.saveRule(home, null, "Claude rule", "anthropic/claude-sonnet-4-5", "Use tools carefully.")
+        OpencodeStore.saveRule(home, null, "Bare model", "glm-4.6", "Short answers.")
+
+        val rules = OpencodeStore.rules(home)
+
+        eq("three rules", rules.size, 3)
+        eq("global rule file", rules.first { it.model == null }.fileName.endsWith(".md"), true)
+
+        val instructions = (OpencodeStore.readMap(OpencodeStore.configFile(home))["instructions"] as? List<*>).orEmpty()
+
+        eq("one global instruction", instructions.size, 1)
+        check("instruction is a guest path", (instructions.first() as String).startsWith("/root/.config/opencode/rules/"))
+
+        val plugin = File(OpencodeStore.pluginsDir(home), OpencodeStore.RULES_PLUGIN)
+
+        check("rules plugin written", plugin.exists())
+        check("plugin has model rule", plugin.readText().contains("anthropic/claude-sonnet-4-5"))
+        check("plugin has bare model rule", plugin.readText().contains("glm-4.6"))
+        check("plugin has hook", plugin.readText().contains("experimental.chat.system.transform"))
+
+        // Editing and deleting
+        val edited = OpencodeStore.saveRule(home, rules.first { it.name == "Global style" }, "Global style v2", null, "Be very brief.")
+
+        eq("renamed", edited.name, "Global style v2")
+        eq("content updated", OpencodeStore.ruleContent(home, edited), "Be very brief.")
+        eq("still one global instruction", (OpencodeStore.readMap(OpencodeStore.configFile(home))["instructions"] as? List<*>).orEmpty().size, 1)
+
+        for (rule in OpencodeStore.rules(home)) OpencodeStore.deleteRule(home, rule)
+
+        check("no rules left", OpencodeStore.rules(home).isEmpty())
+        eq("instructions removed", (OpencodeStore.readMap(OpencodeStore.configFile(home))["instructions"] as? List<*>).orEmpty().size, 0)
+    } finally {
+        Fs.deleteTree(base)
+    }
+}
+
 fun main(args: Array<String>) {
     val fixtures = File(args[0])
 
@@ -772,11 +899,14 @@ fun main(args: Array<String>) {
     testPortPicker()
     testProfiles()
     testLogin()
+    testLoginFault()
+    testMiniJsonWrite()
     testHttpTransport()
     testOta(fixtures)
     testBridge()
     testOtaPackage(fixtures)
     testGuestPaths()
+    testOpencodeStore()
 
     println("passed: $passed, failed: ${failures.size}")
     failures.forEach { println("FAIL: $it") }

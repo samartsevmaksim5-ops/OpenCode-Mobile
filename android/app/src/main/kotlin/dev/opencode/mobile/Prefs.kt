@@ -64,6 +64,11 @@ class Prefs(context: Context) {
         get() = sp.getBoolean("signed_in", false)
         set(value) = sp.edit().putBoolean("signed_in", value).apply()
 
+    /** True when the first-launch sign-in was passed over; the offer does not come back until the app is reinstalled. */
+    var loginSkipped: Boolean
+        get() = sp.getBoolean("login_skipped", false)
+        set(value) = sp.edit().putBoolean("login_skipped", value).apply()
+
     fun markSeen(key: String) = sp.edit().putBoolean("seen_$key", true).apply()
 
     fun forget(key: String) = sp.edit().remove("seen_$key").apply()

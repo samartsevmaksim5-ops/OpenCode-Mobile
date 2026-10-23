@@ -34,6 +34,7 @@ class Palette(context: Context) {
     val accentText = context.getColor(R.color.oc_accent_text)
     val danger = context.getColor(R.color.oc_danger)
     val ok = context.getColor(R.color.oc_ok)
+    val scrim = context.getColor(R.color.oc_scrim)
 }
 
 object Ui {
@@ -162,6 +163,28 @@ object Ui {
             .setTitle(title)
             .setView(box)
             .setPositiveButton("OK") { _, _ -> onOk(field.text.toString().trim()) }
+            .setNegativeButton(tr("Отмена", "Cancel"), null)
+            .show()
+    }
+
+    /** A multi-line text editor for rule (README) content. Hands back the text as typed, without trimming. */
+    fun multilineInput(activity: Activity, title: String, hint: String, initial: String = "", onOk: (String) -> Unit) {
+        val field = EditText(activity).apply {
+            setText(initial)
+            this.hint = hint
+            minLines = 5
+            gravity = Gravity.TOP
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        }
+        val box = FrameLayout(activity).apply {
+            setPadding(dp(activity, 20), dp(activity, 8), dp(activity, 20), 0)
+            addView(field, FrameLayout.LayoutParams(MATCH, WRAP))
+        }
+
+        builder(activity)
+            .setTitle(title)
+            .setView(box)
+            .setPositiveButton("OK") { _, _ -> onOk(field.text.toString()) }
             .setNegativeButton(tr("Отмена", "Cancel"), null)
             .show()
     }

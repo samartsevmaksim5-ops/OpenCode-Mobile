@@ -45,6 +45,52 @@ object MiniJson {
         return out.toString()
     }
 
+    /** Serializes maps, lists, strings and numbers back to JSON, so edited config files keep every unknown key. */
+    fun write(value: Any?): String {
+        val out = StringBuilder()
+
+        writeTo(value, out)
+
+        return out.toString()
+    }
+
+    private fun writeTo(value: Any?, out: StringBuilder) {
+        when (value) {
+            null -> out.append("null")
+            is String -> out.append(quote(value))
+            is Boolean -> out.append(if (value) "true" else "false")
+            is Int, is Long, is Short, is Byte -> out.append(value.toString())
+            is Double -> out.append(if (value % 1.0 == 0.0 && !value.isInfinite()) value.toLong().toString() else value.toString())
+            is Float -> writeTo(value.toDouble(), out)
+            is Map<*, *> -> {
+                out.append('{')
+                var first = true
+
+                for ((k, v) in value) {
+                    if (!first) out.append(',')
+                    first = false
+                    out.append(quote(k.toString())).append(':')
+                    writeTo(v, out)
+                }
+
+                out.append('}')
+            }
+            is Iterable<*> -> {
+                out.append('[')
+                var first = true
+
+                for (v in value) {
+                    if (!first) out.append(',')
+                    first = false
+                    writeTo(v, out)
+                }
+
+                out.append(']')
+            }
+            else -> out.append(quote(value.toString()))
+        }
+    }
+
     private class Reader(private val s: String) {
         private var i = 0
 

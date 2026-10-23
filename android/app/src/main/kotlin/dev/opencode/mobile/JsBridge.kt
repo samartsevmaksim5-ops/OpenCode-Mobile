@@ -44,6 +44,18 @@ class JsBridge(private val activity: MainActivity) {
         activity.runOnUiThread { activity.showPreview(url) }
     }
 
+    /** The sign-in offer shown instead of a raw quota error opens the native sign-in screen. */
+    @JavascriptInterface
+    fun openLogin() {
+        activity.runOnUiThread {
+            try {
+                activity.startActivity(android.content.Intent(activity, LoginActivity::class.java))
+            } catch (e: Exception) {
+                Log.w("bridge", "could not open the sign-in: ${e.message}")
+            }
+        }
+    }
+
     @JavascriptInterface
     fun openExternal(url: String) {
         activity.runOnUiThread { activity.openExternal(url) }

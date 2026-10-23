@@ -124,6 +124,7 @@ class SettingsActivity : Activity() {
         column.removeAllViews()
 
         profilesSection()
+        extensionsSection()
         serverSection()
         updatesSection()
         permissionsSection()
@@ -235,6 +236,26 @@ class SettingsActivity : Activity() {
                 render()
             }
         }
+    }
+
+    private fun extensionsSection() {
+        val card = section(tr("Коннекторы и плагины", "Connectors and plugins"))
+
+        card.line(
+            tr("Коннекторы", "Connectors"),
+            tr("Ключи провайдеров и своё API", "Provider keys and custom APIs"),
+            null,
+        ) { startActivity(Intent(this, ConnectorsActivity::class.java)) }
+        card.line(
+            tr("Плагины", "Plugins"),
+            tr("Из файлов, по ссылкам и npm", "From files, links and npm"),
+            null,
+        ) { startActivity(Intent(this, PluginsActivity::class.java)) }
+        card.line(
+            tr("Правила (README.md)", "Rules (README.md)"),
+            tr("Инструкции для всех моделей или для одной", "Instructions for all models or for one"),
+            null,
+        ) { startActivity(Intent(this, RulesActivity::class.java)) }
     }
 
     private fun serverSection() {
