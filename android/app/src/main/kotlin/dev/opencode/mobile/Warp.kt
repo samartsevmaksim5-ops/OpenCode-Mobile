@@ -11,9 +11,10 @@ import java.util.Base64
 /**
  * The Cloudflare WARP tunnel, without any external tool: an X25519 key pair is generated here (RFC 7748), the WARP
  * account is registered with Cloudflare's client API, and the reply is turned into a wireproxy config. wireproxy (a
- * static Go binary shipped in the APK as libwireproxy.so) connects that config and exposes a local HTTP CONNECT proxy,
- * so the OpenCode server's outbound requests leave through Cloudflare with a fresh IP - which is what resets the
- * shared anonymous free-model limits.
+ * static Go binary shipped in the APK as libwireproxy.so) connects that config and exposes a local HTTP CONNECT proxy
+ * the server's outbound traffic can be pointed at. A tunnel is a network route, not a quota mechanism: the anonymous
+ * free-model limits are counted per IP, and WARP egress addresses are shared, so verify what Cloudflare says before
+ * trusting the route.
  */
 object Warp {
     /** Local ports wireproxy listens on. 25344 is the SOCKS5 spare, 25345 is the HTTP proxy the server is told to use. */
@@ -334,6 +335,12 @@ object Warp {
 
         return Trace(ip, warp)
     }
+
+    /** Accept a trace only when Cloudflare confirms the request actually traversed WARP (warp=on or warp=plus). */
+    fun confirmedTrace(trace: Trace?): Trace? = trace?.takeIf { it.ip.isNotBlank() && it.warp }
+
+    /** A route that is required must provide a non-empty proxy before the local server may start; optional may be direct. */
+    fun proxySatisfiesRequirement(required: Boolean, proxy: String?): Boolean = !required || !proxy.isNullOrBlank()
 
     /**
      * Sends one real request through the local HTTP proxy. wireproxy opens its listening port even when the WireGuard

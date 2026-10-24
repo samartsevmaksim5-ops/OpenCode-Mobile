@@ -9,7 +9,7 @@ src="$root/android/app/src/main/kotlin/dev/opencode/mobile"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-pure="MiniJson Sse Urls Fs TarGz ProotCommand Profiles ConsoleLogin Ota BridgeServer GuestPaths PortPicker WidgetContent Strings OpencodeStore Warp Limits"
+pure="MiniJson Sse Urls Fs TarGz ProotCommand Profiles ConsoleLogin Ota BridgeServer GuestPaths PortPicker WidgetContent Strings OpencodeStore Warp Limits NetworkDiagnostics VpnSubscriptionParser"
 files=()
 for f in $pure; do files+=("$src/$f.kt"); done
 

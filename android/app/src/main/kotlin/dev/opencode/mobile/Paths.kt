@@ -39,11 +39,20 @@ class Paths(context: Context) {
 
     val otaState = File(ota, "state.json")
 
+    /** App-private storage for the VPN subscription feature: imported servers, sing-box config and its log. */
+    val networkDir = File(files, "network")
+
+    val vpnNodesFile = File(networkDir, "vpn-servers.txt")
+
+    val vpnConfigFile = File(networkDir, "sing-box.json")
+
+    val vpnLogFile = File(networkDir, "sing-box.log")
+
     val downloadsCache = File(context.cacheDir, "downloads")
 
     fun otaVersion(id: String) = File(otaVersions, id)
 
     fun ensure() {
-        for (dir in listOf(files, fakeProc, prootTmp, profilesDir, logs, ota, otaVersions, downloadsCache)) dir.mkdirs()
+        for (dir in listOf(files, fakeProc, prootTmp, profilesDir, logs, ota, otaVersions, networkDir, downloadsCache)) dir.mkdirs()
     }
 }

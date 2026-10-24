@@ -102,13 +102,9 @@ class EventWatcher(
             if (seen.size > 200) seen.remove(seen.first())
         }
 
-        // A used-up limit rotates the tunnel whether or not the page is open: the page cannot notice anything while
-        // the app sits in the background, which is exactly when long tasks run into the limit.
-        if (Limits.carriesLimit(event.type, event.raw)) {
-            val app = context.applicationContext as? App
-
-            if (app != null) runCatching { app.warp.onLimit("event ${event.type}") }
-        }
+        // Quota and rate-limit events are provider answers, not network failures: the tunnel is a route, not a quota
+        // mechanism, so nothing here reconnects or re-registers WARP. The honest answers to a spent limit are waiting
+        // for the reset or signing in with an account that has quota of its own.
 
         if (!enabled() || inForeground()) return
 

@@ -255,19 +255,10 @@
   (document.head || document.documentElement).appendChild(composerStyle);
 
   // A person without a connected account hits a bare quota error as soon as the free models run out. Replace that
-  // dead end with an offer to sign in, plus a button that opens the app's own sign-in screen.
+  // dead end with accurate guidance, plus a button that opens the app's own sign-in screen. Quota errors are provider
+  // answers: reconnecting a tunnel cannot bring a spent limit back, so nothing here rotates or re-registers WARP.
   var QUOTA = /(rate[\s_-]?limit(?:ed)?|too\s+many\s+requests|\b429\b|insufficient[_ ]?quota|quota\s*(?:exceeded|exhausted|has been exceeded|will run out|is exhausted)|exceeded\s+your\s+current\s+quota|exceeded\s*(?:your|the|its)?\s*(?:usage|quota|free)|plan\s+and\s+billing|(?:free|usage|request)\s*(?:quota|limit)|(?:credit|credits?|tokens?)\s*(?:exhausted|used up)|\b\u043a\u0432\u043e\u0442\w*\s*(?:\u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d\w*|\u043f\u0440\u0435\u0432\u044b\u0448\u0435\u043d\w*|\u0437\u0430\u043a\u043e\u043d\u0447\u0438\u043b\w*)|\b\u043b\u0438\u043c\u0438\u0442\w*\s*(?:\u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d\w*|\u043f\u0440\u0435\u0432\u044b\u0448\u0435\u043d\w*|\u0437\u0430\u043a\u043e\u043d\u0447\u0438\u043b\w*)|(?:\u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d\w*|\u0437\u0430\u043a\u043e\u043d\u0447\u0438\u043b\w*)\s*(?:\u043b\u0438\u043c\u0438\u0442\w*|\u043a\u0432\u043e\u0442\w*))/i;
   var quotaHandled = new WeakSet();
-  var lastRotate = 0;
-
-  /** Whether the WARP tunnel is a thing on this setup: without it the replacement text must not promise a new IP. */
-  function warpActive() {
-    try {
-      return !!(native.warpActive && native.warpActive());
-    } catch (e) {
-      return false;
-    }
-  }
 
   function makeSignInButton() {
     var button = document.createElement("button");
@@ -319,21 +310,12 @@
 
     quotaHandled.add(parent);
 
-    // The tunnel rebuild gives a fresh Cloudflare egress IP, which resets the shared anonymous limits. Fire it once
-    // per cooldown (native code merges bursts too, and a repeat within three minutes rebuilds the identity) so a page full of identical errors cannot hammer the reconnect, and only when a tunnel exists.
-    var now = Date.now();
-
-    if (warpActive() && now - lastRotate > 20000) {
-      lastRotate = now;
-
-      try {
-        native.rotateWarp();
-      } catch (e) {}
-    }
-
-    node.nodeValue = warpActive()
-      ? "\u041d\u0430 \u044d\u0442\u043e\u043c IP \u043b\u0438\u043c\u0438\u0442\u044b \u0431\u0435\u0441\u043f\u043b\u0430\u0442\u043d\u044b\u0445 \u043c\u043e\u0434\u0435\u043b\u0435\u0439 \u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d\u044b. \u041f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u0435 \u043f\u0435\u0440\u0435\u0441\u043e\u0437\u0434\u0430\u0451\u0442 \u0442\u0443\u043d\u043d\u0435\u043b\u044c Cloudflare WARP \u2014 \u0447\u0435\u0440\u0435\u0437 \u043f\u0430\u0440\u0443 \u0441\u0435\u043a\u0443\u043d\u0434 \u0431\u0443\u0434\u0435\u0442 \u043d\u043e\u0432\u044b\u0439 IP, \u043e\u0442\u043f\u0440\u0430\u0432\u044c\u0442\u0435 \u0437\u0430\u043f\u0440\u043e\u0441 \u0441\u043d\u043e\u0432\u0430. \u041d\u0430\u0434\u0451\u0436\u043d\u044b\u0439 \u0432\u0430\u0440\u0438\u0430\u043d\u0442 \u2014 \u0441\u0432\u043e\u0439 \u0430\u043a\u043a\u0430\u0443\u043d\u0442: \u043a\u0432\u043e\u0442\u0430 \u0431\u0443\u0434\u0435\u0442 \u043b\u0438\u0447\u043d\u043e\u0439."
-      : "\u041b\u0438\u043c\u0438\u0442\u044b \u0431\u0435\u0441\u043f\u043b\u0430\u0442\u043d\u044b\u0445 \u043c\u043e\u0434\u0435\u043b\u0435\u0439 \u043d\u0430 \u044d\u0442\u043e\u0442 \u0447\u0430\u0441 \u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d\u044b. \u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u0435 \u0441\u0432\u043e\u0439 \u0430\u043a\u043a\u0430\u0443\u043d\u0442 \u043d\u0438\u0436\u0435 \u2014 \u043a\u0432\u043e\u0442\u0430 \u0441\u0442\u0430\u043d\u0435\u0442 \u043b\u0438\u0447\u043d\u043e\u0439.";
+    // Quota and rate-limit responses are not tunnel failures; a reconnect cannot bring a spent limit back. The
+    // replacement text says what actually helps: wait for the reset or sign in with an account that has quota.
+    var isRussian = (document.documentElement.lang || navigator.language || "").toLowerCase().indexOf("ru") === 0;
+    node.nodeValue = isRussian
+      ? "\u041b\u0438\u043c\u0438\u0442 \u0431\u0435\u0441\u043f\u043b\u0430\u0442\u043d\u044b\u0445 \u043c\u043e\u0434\u0435\u043b\u0435\u0439 \u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d. \u0414\u043e\u0436\u0434\u0438\u0442\u0435\u0441\u044c \u0441\u0431\u0440\u043e\u0441\u0430 \u043a\u0432\u043e\u0442\u044b \u0438\u043b\u0438 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u0435 \u0441\u0432\u043e\u0439 \u0430\u043a\u043a\u0430\u0443\u043d\u0442 \u0441 \u0434\u043e\u0441\u0442\u0443\u043f\u043d\u043e\u0439 \u043a\u0432\u043e\u0442\u043e\u0439 \u2014 \u0441\u0432\u043e\u0439 Gmail \u043c\u043e\u0436\u043d\u043e \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u043a\u043d\u043e\u043f\u043a\u043e\u0439 \u043d\u0438\u0436\u0435."
+      : "The free-model limit has been reached. Wait for the quota to reset, or sign in with an account that has available quota - connect your own account with the button below.";
 
     // Insert next to the error block, never inside it: the React-owned children would carry the button away on the
     // next render, and a button inside can also trip React's reconciliation. One button per error block.

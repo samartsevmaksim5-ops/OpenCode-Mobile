@@ -139,6 +139,7 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq patchelf
           bash runtime/fetch-proot.sh out/jniLibs/arm64-v8a
           bash runtime/fetch-wireproxy.sh out/jniLibs/arm64-v8a
+          bash runtime/fetch-sing-box.sh out/jniLibs/arm64-v8a
 
       - name: Build date
         id: seq
@@ -149,6 +150,9 @@ jobs:
 
       - name: Linux userland archive
         run: bash runtime/build-rootfs.sh out/server/opencode out/assets "${{ steps.up.outputs.version }}-${{ steps.seq.outputs.seq }}"
+
+      - name: Include sing-box license
+        run: curl -fsSL --retry 3 --max-time 30 https://raw.githubusercontent.com/SagerNet/sing-box/v1.12.9/LICENSE -o out/assets/sing-box-LICENSE.txt
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -253,7 +257,7 @@ jobs:
           echo "apk=$apk"
           # Read the listing once; matching it with grep -q in a loop is fragile and slow for a 250 MB APK.
           unzip -Z1 "$apk" > "$RUNNER_TEMP/apk-files.txt"
-          for want in assets/rootfs.tgz assets/rootfs.stamp assets/bridge.js lib/arm64-v8a/libproot.so lib/arm64-v8a/libproot-loader.so lib/arm64-v8a/libtalloc.so lib/arm64-v8a/libandroid-shmem.so lib/arm64-v8a/libwireproxy.so; do
+          for want in assets/rootfs.tgz assets/rootfs.stamp assets/bridge.js assets/sing-box-LICENSE.txt lib/arm64-v8a/libproot.so lib/arm64-v8a/libproot-loader.so lib/arm64-v8a/libtalloc.so lib/arm64-v8a/libandroid-shmem.so lib/arm64-v8a/libwireproxy.so lib/arm64-v8a/libsingbox.so; do
             if grep -qxF "$want" "$RUNNER_TEMP/apk-files.txt"; then echo "ok: $want"; else echo "::error::missing from the APK: $want"; exit 1; fi
           done
           apksigner="$(ls "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/*/apksigner | sort -V | tail -1)"

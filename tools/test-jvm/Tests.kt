@@ -909,6 +909,7 @@ fun main(args: Array<String>) {
     testGuestPaths()
     testOpencodeStore()
     testWarp()
+    testNetworkFeatures()
 
     println("passed: $passed, failed: ${failures.size}")
     failures.forEach { println("FAIL: $it") }
@@ -1052,6 +1053,18 @@ fun testWarp() {
     eq("trace parsed", Warp.parseTrace("fl=1\nip=104.28.1.2\nwarp=on\nloc=NL\n"), Warp.Trace("104.28.1.2", true))
     eq("trace without warp", Warp.parseTrace("ip=1.2.3.4\nwarp=off\n"), Warp.Trace("1.2.3.4", false))
     eq("trace without ip", Warp.parseTrace("warp=on\n"), null)
+    eq("trace warp=plus carries", Warp.parseTrace("ip=104.28.9.9\nwarp=plus\n"), Warp.Trace("104.28.9.9", true))
+
+    // Only a trace Cloudflare itself confirms as WARP-carried proves the tunnel; anything else is a plain request.
+    eq("confirmed WARP trace accepted", Warp.confirmedTrace(Warp.Trace("104.28.1.2", true)), Warp.Trace("104.28.1.2", true))
+    eq("unconfirmed WARP trace rejected", Warp.confirmedTrace(Warp.Trace("1.2.3.4", false)), null)
+    eq("missing trace rejected", Warp.confirmedTrace(null), null)
+
+    // A route that is required must provide a proxy before the server may start; an optional one may be direct.
+    check("required route fails closed without proxy", !Warp.proxySatisfiesRequirement(true, null))
+    check("required route fails closed on empty proxy", !Warp.proxySatisfiesRequirement(true, ""))
+    check("required route accepts a verified proxy", Warp.proxySatisfiesRequirement(true, Warp.PROXY_URL))
+    check("optional route permits direct mode", Warp.proxySatisfiesRequirement(false, null))
 
     // Limit recognition on the event stream.
     check("free limit event", Limits.carriesLimit("session.step.failed", "{\"error\":{\"type\":\"provider.free-limit\",\"message\":\"Free usage limit reached\"}}"))
@@ -1074,4 +1087,67 @@ fun testWarp() {
             ProotCommand.segfaultIn("killed by SIGSEGV"),
     )
     check("no segfault in a clean log", !ProotCommand.segfaultIn("server listening on http://127.0.0.1:4099"))
+}
+
+// Network diagnostics and VLESS/Hysteria2 subscription parsing.
+
+fun testNetworkFeatures() {
+    val vless = VpnSubscriptionParser.parseUri(
+        "vless://123e4567-e89b-12d3-a456-426614174000@de.example.net:443?encryption=none&security=reality&sni=example.net&fp=chrome&pbk=WwrPBX0txbX4KOtconVnvGwctm2v1jK7dGdOMOikvHo%3D&sid=abcd&type=ws&host=cdn.example.net&path=%2Fws#DE%20Frankfurt",
+    )
+    eq("VLESS protocol parsed", vless.protocol, "VLESS")
+    eq("VLESS server host parsed", vless.host, "de.example.net")
+    eq("VLESS port parsed", vless.port, 443)
+    eq("VLESS uuid parsed", vless.user, "123e4567-e89b-12d3-a456-426614174000")
+    eq("VLESS display label decoded", vless.name, "DE Frankfurt")
+
+    // The Reality public key must survive the journey into the config in the exact form sing-box decodes:
+    // unpadded URL-safe base64. A "PUBKEY" placeholder is not a key at all and must be refused.
+    throws("reality key must be base64") { VpnSubscriptionParser.realityKey("PUBKEY") }
+    throws("reality key must be 32 bytes") { VpnSubscriptionParser.realityKey("c2hvcnQ=") }
+
+    // Standard base64 with "+" and "/" and padding is the common form in real links; sing-box wants URL-safe raw.
+    val standardKey = "++++rd6rrbq+7/7t3q2+7/7t3q2+7/7t3q2+7/7t3q0="
+    eq("reality key normalized to url-safe raw", VpnSubscriptionParser.realityKey(standardKey), "----rd6rrbq-7_7t3q2-7_7t3q2-7_7t3q2-7_7t3q0")
+    eq("reality key accepted as url-safe raw", VpnSubscriptionParser.realityKey("WwrPBX0txbX4KOtconVnvGwctm2v1jK7dGdOMOikvHo="), "WwrPBX0txbX4KOtconVnvGwctm2v1jK7dGdOMOikvHo")
+    eq("reality key accepted as unpadded standard", VpnSubscriptionParser.realityKey("WwrPBX0txbX4KOtconVnvGwctm2v1jK7dGdOMOikvHo"), "WwrPBX0txbX4KOtconVnvGwctm2v1jK7dGdOMOikvHo")
+
+    val vlessConfig = VpnSubscriptionParser.singBoxConfig(vless, 25346)
+    check("VLESS config has vless outbound", vlessConfig.contains("vless"))
+    check("VLESS config carries Reality key", vlessConfig.contains("WwrPBX0txbX4KOtconVnvGwctm2v1jK7dGdOMOikvHo"))
+    check("VLESS config has ws transport", vlessConfig.contains("ws"))
+    check("local mixed proxy binds to loopback", vlessConfig.contains("127.0.0.1"))
+    check("route final points at the proxy", vlessConfig.contains("proxy"))
+
+    val hysteria = VpnSubscriptionParser.parseUri(
+        "hysteria2://pass%2Bword@nl.example.net:443?sni=nl.example.net&obfs=salamander&obfs-password=secret#NL%20Amsterdam",
+    )
+    eq("Hysteria2 protocol parsed", hysteria.protocol, "Hysteria2")
+    eq("Hysteria2 password decoded", hysteria.user, "pass+word")
+    val hysteriaConfig = VpnSubscriptionParser.singBoxConfig(hysteria, 25346)
+    check("Hysteria2 config has correct outbound", hysteriaConfig.contains("hysteria2"))
+    check("Hysteria2 config includes obfuscation", hysteriaConfig.contains("salamander"))
+
+    val extracted = VpnSubscriptionParser.parseSubscriptionText(
+        "vless://123e4567-e89b-12d3-a456-426614174000@de.example.net:443?security=tls&sni=de.example.net#DE\n" +
+            "hysteria2://pass@nl.example.net:443?sni=nl.example.net#NL",
+    )
+    eq("multi-node subscription parsed", extracted.size, 2)
+
+    val plainVless = VpnSubscriptionParser.parseUri("vless://123e4567-e89b-12d3-a456-426614174000@de.example.net:443?security=tls&sni=de.example.net#DE")
+    eq("plain TLS VLESS accepted", plainVless.parameters["security"], "tls")
+    check("plain TLS config has no reality block", !VpnSubscriptionParser.singBoxConfig(plainVless, 25346).contains("reality"))
+
+    val query = NetworkDiagnostics.makeDnsQuery("example.com", 0xBEEF)
+    eq("DNS query id high byte", query[0].toInt() and 0xff, 0xBE)
+    eq("DNS query id low byte", query[1].toInt() and 0xff, 0xEF)
+    eq("DNS query has one question", (query[4].toInt() and 0xff) shl 8 or (query[5].toInt() and 0xff), 1)
+    val response = ByteArray(12)
+    response[0] = 0xBE.toByte(); response[1] = 0xEF.toByte()
+    response[2] = 0x81.toByte(); response[3] = 0x80.toByte()
+    response[6] = 0; response[7] = 1
+    check("valid DNS response accepted", NetworkDiagnostics.validDnsResponse(response, 0xBEEF))
+    response[3] = 0x83.toByte()
+    check("DNS failure response rejected", !NetworkDiagnostics.validDnsResponse(response, 0xBEEF))
+    eq("three DNS providers available", NetworkDiagnostics.resolvers.size, 3)
 }

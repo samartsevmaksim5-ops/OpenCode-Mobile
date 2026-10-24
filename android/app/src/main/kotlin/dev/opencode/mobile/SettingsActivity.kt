@@ -12,6 +12,8 @@ import android.widget.ScrollView
 import android.widget.Switch
 import android.widget.TextView
 import java.io.File
+import java.net.InetSocketAddress
+import java.net.Proxy
 import java.text.DateFormat
 import java.util.Date
 
@@ -23,6 +25,9 @@ class SettingsActivity : Activity() {
     private var unsubscribeState: (() -> Unit)? = null
     private var unsubscribeUpdates: (() -> Unit)? = null
     private var unsubscribeWarp: (() -> Unit)? = null
+    private var networkIpStatus = tr("Нажми «Обновить IP и геолокацию», чтобы проверить текущий маршрут.", "Tap Refresh IP and location to check the current route.")
+    private var dnsTestStatus = tr("DNS-тесты выключены. Включи их, чтобы вручную проверить резолверы.", "DNS tests are off. Enable them to check resolvers manually.")
+    private var networkTaskActive = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -128,6 +133,7 @@ class SettingsActivity : Activity() {
 
         profilesSection()
         warpSection()
+        networkSection()
         extensionsSection()
         serverSection()
         updatesSection()
@@ -168,8 +174,8 @@ class SettingsActivity : Activity() {
                     Ui.text(
                         this,
                         tr(
-                            "Без своего аккаунта лимиты бесплатных моделей общие для всех, и их можно израсходовать. Подключите Gmail — квота станет вашей личной. Аккаунт, созданный в браузере, начнёт работать только после входа в приложении; до тех пор выручает WARP.",
-                            "Without your own account the free-model limits are shared by everyone and can run out. Connect Gmail to get a quota of your own. An account created in a browser only works after signing in inside the app; until then WARP covers you.",
+                            "Без своего аккаунта лимиты бесплатных моделей считаются по IP-адресу и общие для всех, кто сидит на нём. Подключите Gmail — квота станет вашей личной. Аккаунт, созданный в браузере, начнёт работать только после входа в приложении.",
+                            "Without your own account the free-model limits are counted per IP address and shared with everyone behind it. Connect Gmail to get a quota of your own. An account created in a browser only works after signing in inside the app.",
                         ),
                         12f,
                         palette.faint,
@@ -189,7 +195,7 @@ class SettingsActivity : Activity() {
         }
     }
 
-    /** The Cloudflare WARP tunnel: a clean IP for the shared anonymous free-model limits, auto-rotated on a limit. */
+    /** The Cloudflare WARP tunnel: an opt-in network route for the server's outbound traffic. */
     private fun warpSection() {
         val card = section(tr("Cloudflare WARP", "Cloudflare WARP"))
         val status = app.warp.status
@@ -198,8 +204,8 @@ class SettingsActivity : Activity() {
             Ui.text(
                 this,
                 tr(
-                    "Без аккаунта лимиты бесплатных моделей общие по IP. WARP пускает запросы к моделям через Cloudflare с чистым адресом, а при упоре в лимит сам пересоздаёт туннель и меняет IP. С подключённым аккаунтом WARP не используется — квота и так личная.",
-                    "Without an account the free-model limits are shared per IP. WARP routes model requests through Cloudflare with a clean address and rebuilds the tunnel on its own when a limit is hit. With a connected account WARP stays idle - the quota is personal anyway.",
+                    "WARP маршрутизирует исходящие запросы сервера через Cloudflare. По умолчанию выключено: квота бесплатных моделей считается по IP, а адреса выхода WARP общие для миллионов пользователей, поэтому туннель с первого же сообщения может попасть на исчерпанную квоту. Включайте, если ваш собственный адрес заблокирован или его квота уже израсходована. Это сетевой маршрут, а не способ сбросить лимит. С подключённым аккаунтом WARP не используется.",
+                    "WARP routes the server's outbound requests through Cloudflare. It is off by default: the free-model quota is counted per IP, and WARP egress addresses are shared by millions of users, so a tunnel can land on a drained quota from the very first message. Enable it when your own address is blocked or its quota is spent. This is a network route, not a way to reset a limit. With a connected account WARP stays idle.",
                 ),
                 12f,
                 palette.muted,
@@ -240,7 +246,6 @@ class SettingsActivity : Activity() {
         }
         val detail = when {
             status.phase == WarpManager.Phase.FAILED && status.detail.isNotEmpty() -> "$label: ${status.detail}"
-            status.rotations > 0 -> "$label · ${tr("IP обновлён", "IP refreshed")} ×${status.rotations}"
             else -> label
         }
         val badgeText = when (status.phase) {
@@ -251,39 +256,204 @@ class SettingsActivity : Activity() {
         }
 
         card.line(tr("Состояние", "State"), detail, state(badgeText, status.phase == WarpManager.Phase.RUNNING || status.phase == WarpManager.Phase.OFF))
+    }
+
+    /** Current egress and DNS diagnostics live in Settings, separate from the floating shortcut menu. */
+    private fun diagnosticsProxy(): Proxy? {
+        app.vpn.proxy()?.let { return it }
+        if (app.warp.status.phase == WarpManager.Phase.RUNNING && app.warp.listening()) {
+            return Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", Warp.HTTP_PORT))
+        }
+        return null
+    }
+
+    private fun networkSection() {
+        val card = section(tr("Сеть, IP и VPN", "Network, IP and VPN"))
+        card.addView(
+            Ui.text(
+                this,
+                tr(
+                    "Проверка IP выполняется только по нажатию. Для города и региона IP отправляется в ipwho.is; DNS-тесты проверяют доступность трёх DoH-серверов, но не меняют DNS Android и по умолчанию выключены.",
+                    "IP lookup runs only when requested. The public IP is sent to ipwho.is for city and region data; DNS tests check three DoH resolvers but do not change Android DNS and are off by default.",
+                ),
+                12f,
+                palette.muted,
+            ),
+            Ui.params(bottom = Ui.dp(this, 8)),
+        )
+        card.line(tr("Текущий публичный IP и расположение", "Current public IP and location"), networkIpStatus)
+        card.action(tr("Обновить IP и геолокацию", "Refresh IP and location"), primary = true) {
+            if (networkTaskActive) return@action
+            networkTaskActive = true
+            networkIpStatus = tr("Проверяю текущий маршрут...", "Checking the current route...")
+            render()
+            val proxy = diagnosticsProxy()
+            Thread({
+                val result = NetworkDiagnostics.currentIpLocationText(proxy)
+                runOnUiThread {
+                    networkIpStatus = result
+                    networkTaskActive = false
+                    render()
+                }
+            }, "network-ip-check").apply { isDaemon = true; start() }
+        }
 
         card.divide()
-        card.action(tr("Обновить IP сейчас", "Refresh the IP now")) {
-            Ui.toast(this, tr("Пересоздаю туннель WARP...", "Rebuilding the WARP tunnel..."))
-            app.warp.rotate("manual refresh") { ok ->
+        card.toggle(
+            tr("Разрешить ручной DNS-тест", "Enable manual DNS tests"),
+            tr("По умолчанию выключено. Проверяет DNS-over-HTTPS, не меняя системные DNS-настройки.", "Off by default. Tests DNS-over-HTTPS without changing system DNS settings."),
+            app.prefs.dnsDiagnosticsEnabled,
+        ) { enabled ->
+            app.prefs.dnsDiagnosticsEnabled = enabled
+            dnsTestStatus = if (enabled) tr("Готово к проверке. Нажми кнопку ниже.", "Ready. Press the test button below.") else tr("DNS-тесты выключены.", "DNS tests are disabled.")
+            render()
+        }
+        card.addView(
+            Ui.text(
+                this,
+                "Cloudflare · cloudflare-dns.com\nGoogle Public DNS · dns.google\nAdGuard DNS · dns.adguard-dns.com",
+                12f,
+                palette.faint,
+            ),
+            Ui.params(top = Ui.dp(this, 5), bottom = Ui.dp(this, 5)),
+        )
+        card.action(tr("Проверить DNS-серверы", "Test DNS resolvers")) {
+            if (!app.prefs.dnsDiagnosticsEnabled) {
+                Ui.toast(this, tr("Сначала включи ручной DNS-тест", "Enable manual DNS tests first"))
+                return@action
+            }
+            if (networkTaskActive) return@action
+            networkTaskActive = true
+            dnsTestStatus = tr("Проверяю резолверы...", "Testing resolvers...")
+            render()
+            val proxy = diagnosticsProxy()
+            Thread({
+                val report = NetworkDiagnostics.testDns(proxy).joinToString("\n") { it.display() }
                 runOnUiThread {
-                    Ui.toast(
-                        this,
-                        if (ok) tr("Готово: новый IP", "Done: a new IP") else tr("Не удалось, туннель поднимется с сервером", "Could not do it now; the tunnel will start with the server"),
-                    )
+                    dnsTestStatus = report
+                    networkTaskActive = false
+                    render()
                 }
+            }, "network-dns-check").apply { isDaemon = true; start() }
+        }
+        card.addView(Ui.text(this, dnsTestStatus, 12f, palette.muted), Ui.params(top = Ui.dp(this, 6)))
+        card.addView(
+            Ui.text(
+                this,
+                tr(
+                    "Если DNS доступен, а сайты всё равно не открываются, причина может быть в маршрутизации, TLS, блокировке провайдера или самом сервисе — один DNS-тест это не исправляет.",
+                    "Working DNS does not guarantee site access: routing, TLS, ISP filtering or the service itself may still cause errors.",
+                ),
+                12f,
+                palette.faint,
+            ),
+            Ui.params(top = Ui.dp(this, 6)),
+        )
+
+        card.divide()
+        card.toggle(
+            tr("Использовать VPN-подписку", "Use VPN subscription"),
+            tr("VLESS/Hysteria2 через sing-box только для локального OpenCode-сервера. По умолчанию выключено.", "VLESS/Hysteria2 via sing-box for the local OpenCode server only. Off by default."),
+            app.prefs.vpnSubscriptionEnabled,
+        ) { enabled ->
+            if (enabled && app.prefs.remote) {
+                Ui.toast(this, tr("VPN-подписка применяется только к локальному серверу", "VPN subscriptions apply only to the local server"))
+                render()
+                return@toggle
+            }
+            if (enabled && app.vpn.nodes().isEmpty()) {
+                Ui.toast(this, tr("Сначала импортируй подписку или ссылку сервера", "Import a subscription or server link first"))
+                render()
+                return@toggle
+            }
+            app.prefs.vpnSubscriptionEnabled = enabled
+            if (enabled) app.warp.stop("VPN subscription selected") else app.vpn.stop("VPN subscription disabled")
+            if (!app.prefs.remote && ServerState.snapshot.phase == Phase.RUNNING) {
+                Ui.toast(this, tr("Перезапускаю локальный сервер для применения маршрута...", "Restarting the local server to apply the route..."))
+                ServerService.send(this, ServerService.ACTION_RESTART)
+            }
+            render()
+        }
+        val vpnStatus = app.vpn.status
+        val vpnLabel = when (vpnStatus.phase) {
+            VpnSubscriptionManager.Phase.OFF -> tr("Отключён", "Off")
+            VpnSubscriptionManager.Phase.PREPARING -> tr("Подключается...", "Connecting...")
+            VpnSubscriptionManager.Phase.RUNNING -> tr("Подключён", "Connected")
+            VpnSubscriptionManager.Phase.FAILED -> tr("Ошибка", "Failed")
+        }
+        card.line(tr("Состояние VPN-подписки", "Subscription VPN status"), listOf(vpnLabel, vpnStatus.selected, vpnStatus.detail).filter { it.isNotBlank() }.distinct().joinToString(" · "), state(vpnLabel, vpnStatus.phase == VpnSubscriptionManager.Phase.RUNNING))
+        card.action(tr("Импортировать HTTPS-подписку", "Import HTTPS subscription")) {
+            Ui.input(this, tr("URL подписки (HTTPS)", "Subscription URL (HTTPS)"), "https://", app.prefs.vpnSubscriptionUrl) { address ->
+                if (!address.startsWith("https://", ignoreCase = true)) {
+                    Ui.toast(this, tr("Разрешены только HTTPS-ссылки подписки", "Only HTTPS subscription URLs are allowed"))
+                    return@input
+                }
+                app.prefs.vpnSubscriptionUrl = address
+                Ui.toast(this, tr("Загружаю подписку...", "Downloading the subscription..."))
+                Thread({
+                    val outcome = runCatching { app.vpn.importSubscription(address) }
+                    runOnUiThread {
+                        outcome.onSuccess { count -> Ui.toast(this, tr("Импортировано серверов: $count", "Imported servers: $count")) }
+                            .onFailure { Ui.toast(this, tr("Импорт не удался: ${it.message}", "Import failed: ${it.message}")) }
+                        render()
+                    }
+                }, "vpn-subscription-import").apply { isDaemon = true; start() }
             }
         }
-        card.action(tr("Новая учётная запись WARP", "New WARP identity")) {
-            Ui.confirm(
-                this,
-                tr("Новая учётная запись WARP", "New WARP identity"),
-                tr(
-                    "Текущая регистрация WARP будет удалена и создана новая - с новым ключом и адресом. Продолжить?",
-                    "The current WARP registration is deleted and a new one is created - a new key and address. Continue?",
-                ),
-                tr("Создать", "Create"),
-            ) {
-                Ui.toast(this, tr("Регистрирую новую учётную запись...", "Registering a new identity..."))
-                app.warp.reRegister { ok ->
-                    runOnUiThread {
-                        Ui.toast(
-                            this,
-                            if (ok) tr("Новая учётная запись готова", "The new identity is ready") else tr("Не удалось зарегистрировать: проверьте интернет", "Registration failed: check the internet"),
-                        )
-                    }
-                }
+        card.action(tr("Добавить VLESS/Hysteria2-ссылку", "Add a VLESS/Hysteria2 link")) {
+            Ui.input(this, tr("Ссылка или текст подписки", "Link or subscription text"), "vless://... hysteria2://...", "") { content ->
+                val outcome = runCatching { app.vpn.importText(content) }
+                outcome.onSuccess { count -> Ui.toast(this, tr("Импортировано серверов: $count", "Imported servers: $count")) }
+                    .onFailure { Ui.toast(this, tr("Не удалось разобрать: ${it.message}", "Could not parse: ${it.message}")) }
+                render()
             }
+        }
+
+        val nodes = app.vpn.nodes()
+        card.line(tr("Серверы в подписке", "Servers in subscription"), tr("Всего: ${nodes.size}; поддерживаются VLESS и Hysteria2", "Total: ${nodes.size}; VLESS and Hysteria2 are supported"))
+        val selectedKey = app.prefs.vpnSelectedNode
+        if (nodes.isNotEmpty()) card.action(tr("Выбрать сервер из всей подписки", "Choose from all subscription servers")) {
+            Ui.choose(this, tr("VPN-серверы", "VPN servers"), nodes.map { "${it.name} (${it.protocol} · ${it.host}:${it.port})" }) { index ->
+                app.vpn.select(nodes[index].key)
+                if (app.prefs.vpnSubscriptionEnabled && !app.prefs.remote && ServerState.snapshot.phase == Phase.RUNNING) {
+                    ServerService.send(this, ServerService.ACTION_RESTART)
+                }
+                render()
+            }
+        }
+        for (node in nodes.take(12)) {
+            val selected = node.key == selectedKey || (selectedKey.isBlank() && node == nodes.firstOrNull())
+            card.line(node.name, "${node.protocol} · ${node.host}:${node.port}", state(if (selected) tr("Выбран", "Selected") else tr("Выбрать", "Select"), selected)) {
+                app.vpn.select(node.key)
+                if (app.prefs.vpnSubscriptionEnabled && !app.prefs.remote && ServerState.snapshot.phase == Phase.RUNNING) {
+                    ServerService.send(this, ServerService.ACTION_RESTART)
+                }
+                render()
+            }
+        }
+        if (nodes.size > 12) card.addView(Ui.text(this, tr("Показаны первые 12 серверов. Остальные сохранены.", "Showing the first 12 servers. The others are saved."), 12f, palette.faint), Ui.params(top = Ui.dp(this, 5)))
+        card.action(tr("Проверить выбранный VPN-сервер", "Test the selected VPN server")) {
+            if (!app.prefs.vpnSubscriptionEnabled) {
+                Ui.toast(this, tr("Включи VPN-подписку, чтобы подключить и проверить сервер", "Enable the VPN subscription to connect and test a server"))
+                return@action
+            }
+            if (networkTaskActive) return@action
+            networkTaskActive = true
+            networkIpStatus = tr("Подключаю выбранный сервер и проверяю внешний IP...", "Connecting and checking the egress IP...")
+            render()
+            Thread({
+                val result = runCatching {
+                    val address = app.vpn.prepare()
+                    val port = address?.substringAfterLast(':')?.toIntOrNull() ?: VpnSubscriptionManager.PORT
+                    val proxy = Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", port))
+                    NetworkDiagnostics.currentIpLocationText(proxy)
+                }.getOrElse { tr("Проверка не удалась", "Test failed") + ": " + (it.message ?: it.javaClass.simpleName) }
+                runOnUiThread {
+                    networkIpStatus = result
+                    networkTaskActive = false
+                    render()
+                }
+            }, "vpn-node-test").apply { isDaemon = true; start() }
         }
     }
 
@@ -648,8 +818,10 @@ class SettingsActivity : Activity() {
                     Fs.deleteTree(app.paths.profilesDir)
                     Fs.deleteTree(app.paths.rootfs)
                     Fs.deleteTree(app.paths.ota)
+                    Fs.deleteTree(app.paths.networkDir)
                     app.paths.rootfsStamp.delete()
                     app.paths.profilesFile.delete()
+                    runCatching { app.vpn.stop("erase all app data") }
                     runCatching { app.warp.stop("erase all app data") }
                     // The dialog promises a full wipe; leftover prefs would silently restore remote mode, compat,
                     // banner state and the rest of it on the next launch.

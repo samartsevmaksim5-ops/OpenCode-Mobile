@@ -20,6 +20,17 @@ texts are inside the filesystem under /usr/share/doc/*/copyright, and sources ar
 Added on top of Ubuntu while the archive is built: Node.js (MIT, https://nodejs.org), uv and uvx (MIT or Apache-2.0,
 https://github.com/astral-sh/uv), ripgrep (MIT or Unlicense), git (GPL-2.0), Python (PSF-2.0).
 
+wireproxy (https://github.com/pufferffish/wireproxy), bundled as libwireproxy.so: the Cloudflare WARP tunnel client.
+It is downloaded from the official release while the APK is built and bundled unmodified apart from the name.
+wireproxy is GPL-3.0; its license text is at the link above, and that is where the corresponding source can be
+obtained.
+
+sing-box (https://github.com/SagerNet/sing-box), bundled as libsingbox.so: the local VLESS/Hysteria2 proxy engine for
+user-imported VPN subscriptions. The pinned official linux-arm64 release (v1.12.9) is downloaded while the APK is
+built and bundled unmodified apart from the name; its LICENSE file ships inside the APK as
+assets/sing-box-LICENSE.txt. sing-box is GPL-3.0, and the link above is where the corresponding source can be
+obtained.
+
 Android platform libraries are used under their own terms and are not redistributed.
 
 If you do not want to carry GPL obligations, keep your APK private: do not publish the releases of your fork.

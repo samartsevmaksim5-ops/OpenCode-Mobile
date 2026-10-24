@@ -57,12 +57,35 @@ class Prefs(context: Context) {
         set(value) = sp.edit().putBoolean("floating_menu", value).apply()
 
     /**
-     * Route the server's outbound traffic through the Cloudflare WARP tunnel. It only matters for the shared
-     * anonymous free-model limits, so the app keeps it off by default once a personal account is connected.
+     * Route the server's outbound traffic through the Cloudflare WARP tunnel. Off by default: anonymous
+     * free-model quota is counted per IP address, and Cloudflare WARP egress addresses are shared by the whole
+     * WARP user base, so a fresh install that tunnels from the first request lands on an IP whose shared
+     * anonymous quota is already drained - the "quota exhausted on the very first message" reports. Direct
+     * connection uses the phone's own IP and its own quota; WARP stays an explicit opt-in for people whose
+     * own address is blocked or drained.
      */
     var warpEnabled: Boolean
-        get() = sp.getBoolean("warp_enabled", true)
+        get() = sp.getBoolean("warp_enabled", false)
         set(value) = sp.edit().putBoolean("warp_enabled", value).apply()
+
+    /** DNS resolver tests in settings are manual diagnostics; off by default and never changes Android's system DNS. */
+    var dnsDiagnosticsEnabled: Boolean
+        get() = sp.getBoolean("dns_diagnostics_enabled", false)
+        set(value) = sp.edit().putBoolean("dns_diagnostics_enabled", value).apply()
+
+    /** Route the local server through a user-supplied VLESS/Hysteria2 subscription (sing-box). Off by default. */
+    var vpnSubscriptionEnabled: Boolean
+        get() = sp.getBoolean("vpn_subscription_enabled", false)
+        set(value) = sp.edit().putBoolean("vpn_subscription_enabled", value).apply()
+
+    var vpnSubscriptionUrl: String
+        get() = sp.getString("vpn_subscription_url", "") ?: ""
+        set(value) = sp.edit().putString("vpn_subscription_url", value.trim()).apply()
+
+    /** Key of the chosen subscription server; blank means the first one. */
+    var vpnSelectedNode: String
+        get() = sp.getString("vpn_selected_node", "") ?: ""
+        set(value) = sp.edit().putString("vpn_selected_node", value).apply()
 
     /** One-time prompts: true once [key] has been shown. */
     fun seen(key: String) = sp.getBoolean("seen_$key", false)

@@ -1,6 +1,8 @@
 package dev.opencode.mobile
 
-/** Recognises "the free-model limit is used up" in what the server reports, so the WARP tunnel can be rotated. */
+/** Recognises "the free-model limit is used up" in what the server reports, so quota answers can be told apart from
+ * real network failures. A quota error must never be treated as a tunnel problem: nothing reconnects or re-registers
+ * WARP because of it - the honest answers are waiting for the reset or a personal account. */
 object Limits {
     private val TEXT = Regex(
         "rate[\\s_-]?limit|too[\\s_-]?many[\\s_-]?requests|\\b429\\b|usage[\\s_-]?limit|free[\\s_-]?usage|" +

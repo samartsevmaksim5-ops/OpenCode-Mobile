@@ -56,49 +56,6 @@ class JsBridge(private val activity: MainActivity) {
         }
     }
 
-    /**
-     * The page hit a limit error: reconnect the WARP tunnel so Cloudflare hands out a different egress IP, which
-     * brings the shared anonymous free-model limits back. The result is reported as a toast.
-     */
-    @JavascriptInterface
-    fun rotateWarp() {
-        // The tunnel probe does a TCP connect, which must never run on the UI thread (NetworkOnMainThreadException
-        // would be swallowed and the rotation would silently never happen). Probe and rotate on a worker thread.
-        Thread {
-            // Without a running tunnel (WARP off, or an account connected) there is nothing to refresh and the page
-            // just shows the sign-in offer as before.
-            val started = runCatching {
-                activity.app.warp.onLimit("page limit error") { ok ->
-                    activity.runOnUiThread {
-                        Ui.toast(
-                            activity,
-                            if (ok) {
-                                tr("WARP: IP обновлён, отправьте запрос ещё раз", "WARP: IP refreshed, send the request again")
-                            } else {
-                                tr("WARP не смог обновить IP", "WARP could not refresh the IP")
-                            },
-                        )
-                    }
-                }
-            }.getOrDefault(false)
-
-            // Not started: no tunnel is running, or a rotation just ran for the same limit (the event stream or an
-            // earlier error on the page). Say something only for the first case.
-            if (!started && !runCatching { activity.app.warp.listening() }.getOrDefault(false)) {
-                activity.runOnUiThread { Ui.toast(activity, tr("WARP не запущен — подключите аккаунт или включите WARP в настройках", "WARP is not running — connect an account or enable WARP in settings")) }
-            }
-        }.start()
-    }
-
-    /**
-     * Whether a WARP tunnel makes sense here: enabled in settings and no personal account on the active profile.
-     * The page uses it to word the quota offer honestly - no tunnel means no "new IP in a few seconds" promise.
-     */
-    @JavascriptInterface
-    fun warpActive(): Boolean = runCatching {
-        activity.app.prefs.warpEnabled && activity.app.profiles.active.account == null
-    }.getOrDefault(false)
-
     @JavascriptInterface
     fun openExternal(url: String) {
         activity.runOnUiThread { activity.openExternal(url) }

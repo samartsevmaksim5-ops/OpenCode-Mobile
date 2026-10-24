@@ -14,7 +14,7 @@ import android.widget.TextView
  * person closes it with the corner cross, a tap on the dark backdrop, or Back; it never comes back afterwards.
  */
 object UpdateBanner {
-    private const val SEEN_KEY = "update_106"
+    private const val SEEN_KEY = "update_107"
 
     /** Guards against a second copy stacking over the first one when the page reports being ready again. */
     private var active = false
@@ -47,7 +47,7 @@ object UpdateBanner {
         // Header: the title on the left, the cross on the right.
         val header = Ui.horizontal(activity)
         header.addView(
-            Ui.text(activity, tr("ОБНОВЛЕНИЕ 1.0.6", "UPDATE 1.0.6"), 16f, palette.text, bold = true),
+            Ui.text(activity, tr("ОБНОВЛЕНИЕ 1.0.7", "UPDATE 1.0.7"), 16f, palette.text, bold = true),
             Ui.params(0, Ui.WRAP, weight = 1f),
         )
         header.addView(Ui.iconButton(activity, R.drawable.ic_close, tr("Закрыть", "Close"), palette, tint = palette.muted, sizeDp = 36) { dismiss() })
@@ -55,7 +55,7 @@ object UpdateBanner {
 
         // The announcement picture with corners rounded to match the card.
         val image = ImageView(activity).apply {
-            setImageResource(R.drawable.update_106)
+            setImageResource(R.drawable.update_107)
             adjustViewBounds = true
             clipToOutline = true
             outlineProvider = object : ViewOutlineProvider() {
@@ -63,19 +63,18 @@ object UpdateBanner {
                     outline.setRoundRect(0, 0, view.width, view.height, Ui.dp(activity, 14).toFloat())
                 }
             }
-            contentDescription = tr("Обновление 1.0.6", "Update 1.0.6")
+            contentDescription = tr("Обновление 1.0.7", "Update 1.0.7")
         }
         card.addView(image, Ui.params(Ui.MATCH, Ui.WRAP, bottom = Ui.dp(activity, 12)))
 
         card.addView(Ui.text(activity, tr("Что изменено:", "What changed:"), 14f, palette.text, bold = true), Ui.params(bottom = Ui.dp(activity, 6)))
 
         for (line in listOf(
-            tr("- добавлен Cloudflare WARP: запросы к моделям идут через чистый IP — общие лимиты бесплатных версий больше не помеха", "- Cloudflare WARP is here: model requests go through a clean IP - shared free-model limits no longer stop you"),
-            tr("- при упоре в лимит туннель сам пересоздаётся с новым IP — без ваших действий и без нового аккаунта", "- when a limit is hit the tunnel rebuilds itself with a fresh IP - no action from you, no new account needed"),
-            tr("- вход по Google больше не навязывается: экран входа никогда не открывается сам, только по вашему нажатию", "- Google sign-in is never pushed on you: the sign-in screen only opens when you tap it"),
-            tr("- исправлены падения «сервер постоянно падает»: проблемные устройства сами переключаются в совместимый режим", "- fixed the keeps crashing loop: affected devices switch to compatibility mode on their own"),
-            tr("- WARP теперь действительно проводит запросы сервера через туннель и проверяет, что трафик идёт; лимиты замечаются и в фоне", "- WARP now really carries the server's requests and checks that traffic flows; limits are noticed in the background too"),
-            tr("- сервер не падает в цикле: счётчик перезапусков сбрасывается, порт профиля больше не «уплывает»", "- no more crash loops: the restart budget resets, and a profile's port no longer drifts"),
+            tr("- исправлено «квота исчерпана» на первом же сообщении: WARP больше не включён по умолчанию, сервер выходит в сеть с вашего собственного IP", "- fixed quota-exhausted on the very first message: WARP is no longer on by default, the server now goes online from your own IP"),
+            tr("- ошибки квоты теперь говорят правду: дождитесь сброса или войдите в аккаунт — без обещаний про «новый IP через пару секунд»", "- quota errors tell the truth now: wait for the reset or sign in - no more promises about a new IP in a few seconds"),
+            tr("- убрана автоперерегистрация WARP при ошибках квоты: это не сетевая проблема, туннель больше не пересоздаётся зря", "- removed the automatic WARP re-registration on quota errors: that is not a network failure, the tunnel is no longer rebuilt in vain"),
+            tr("- добавлен раздел «Сеть, IP и VPN»: проверка публичного IP с геолокацией и ручные DNS-тесты трёх DoH-резолверов", "- new Network, IP and VPN section: public IP check with geolocation and manual DNS tests of three DoH resolvers"),
+            tr("- поддержка VPN-подписок VLESS и Hysteria2 через sing-box — только для локального сервера, по вашему выбору", "- VLESS and Hysteria2 subscription support via sing-box - for the local server only, strictly opt-in"),
         )) {
             card.addView(Ui.text(activity, line, 14f, palette.muted), Ui.params(bottom = Ui.dp(activity, 3)))
         }

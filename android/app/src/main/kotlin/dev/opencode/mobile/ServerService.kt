@@ -43,9 +43,13 @@ class ServerService : Service() {
     @Volatile
     private var runningSince = 0L
 
-    /** True while the running server was started with the WARP proxy in its environment. */
+    /** True while the running server was started with a local outbound proxy in its environment. */
     @Volatile
     private var proxied = false
+
+    /** True when that proxy came from a VPN subscription rather than the Cloudflare WARP tunnel. */
+    @Volatile
+    private var subscriptionProxy = false
 
     /** Bumped on every start and stop so a watchdog or timer from an earlier run can tell it is stale. */
     @Volatile
@@ -147,6 +151,7 @@ class ServerService : Service() {
         // The server belongs to this service; leaving it running without a notification would be a hidden process.
         Thread {
             runCatching { server.stop() }.onFailure { Log.w("service", "could not stop the server: ${it.message}") }
+            app.vpn.stop("service stopped")
             app.warp.stop("service stopped")
         }.start()
 
@@ -269,13 +274,42 @@ class ServerService : Service() {
         var compatRetried = false
 
         while (true) {
-            // The WARP tunnel has to be up before the server starts: the server reads its proxy address from the
-            // environment at spawn time. When the tunnel cannot come up the server simply goes out directly.
-            val warpProxy = app.warp.prepare(profile)
+            // The route must be ready before the server starts, because the server reads its proxy address from the
+            // environment at spawn time. A selected VPN subscription is mandatory - never fall back to a direct
+            // connection silently - and so is WARP when the person explicitly turned it on.
+            val useSubscription = app.prefs.vpnSubscriptionEnabled
+            val outboundProxy = try {
+                if (useSubscription) app.vpn.prepare() else app.warp.prepare(profile)
+            } catch (e: Exception) {
+                Log.w("service", "outbound route preparation failed: ${e.message}")
+                proxied = false
+                subscriptionProxy = false
+                fail(
+                    tr("Не удалось подключить VPN-подписку: ", "Could not connect the VPN subscription: ") + (e.message ?: ""),
+                    false,
+                    profile,
+                )
 
-            proxied = warpProxy != null
+                return
+            }
 
-            val config = server.config(app.prefs, profile, bridgeUrl, otaDir, warpProxy)
+            proxied = outboundProxy != null
+            subscriptionProxy = useSubscription && outboundProxy != null
+
+            if (!useSubscription && !Warp.proxySatisfiesRequirement(app.warp.requiredFor(profile), outboundProxy)) {
+                val detail = app.warp.status.detail.takeIf { it.isNotBlank() }
+                    ?: tr(
+                        "Cloudflare WARP включён, но туннель не подтверждён. Отключите WARP в настройках или проверьте сеть.",
+                        "Cloudflare WARP is enabled, but the tunnel was not verified. Turn WARP off in settings or check the network.",
+                    )
+                Log.w("service", "refusing to start OpenCode without the required WARP route: $detail")
+                proxied = false
+                fail(detail, false, profile)
+
+                return
+            }
+
+            val config = server.config(app.prefs, profile, bridgeUrl, otaDir, outboundProxy)
             val process = try {
                 server.spawn(config)
             } catch (e: Exception) {
@@ -390,6 +424,8 @@ class ServerService : Service() {
 
         quiet()
         server.stop()
+        app.vpn.stop("remote server selected")
+        app.warp.stop("remote server selected")
 
         val base = Urls.normalizeServer(app.prefs.remoteUrl)
 
@@ -475,11 +511,12 @@ class ServerService : Service() {
 
                 if (epoch != my) return@Thread
 
-                // A server that was told to use the tunnel is useless once the tunnel is dead for good (every model
+                // A server that was told to use a proxy is useless once that proxy is dead for good (every model
                 // request would end in "connection refused"): start again, without the proxy if it cannot come back.
-                if (proxied && app.warp.status.phase == WarpManager.Phase.FAILED) {
+                if (proxied && ((subscriptionProxy && app.vpn.status.phase == VpnSubscriptionManager.Phase.FAILED) ||
+                        (!subscriptionProxy && app.warp.status.phase == WarpManager.Phase.FAILED))) {
                     if (++tunnelMisses >= 3) {
-                        Log.w("service", "the WARP tunnel is down for good, restarting the server")
+                        Log.w("service", "the outbound proxy is down for good, restarting the server")
                         run { if (epoch == my) startLocal(apply = false) }
 
                         return@Thread

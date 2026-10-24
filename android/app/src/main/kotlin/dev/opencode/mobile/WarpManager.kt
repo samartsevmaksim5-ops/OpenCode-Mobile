@@ -6,10 +6,11 @@ import java.net.Socket
 import java.util.concurrent.CopyOnWriteArrayList
 
 /**
- * Runs the Cloudflare WARP tunnel for the server's outbound traffic. wireproxy ships as libwireproxy.so (a static Go
- * binary, executed straight from the native library directory) and exposes an HTTP CONNECT proxy on localhost that the
- * Linux environment is pointed at. A reconnect picks a fresh Cloudflare egress IP, which is what brings the shared
- * anonymous free-model limits back; with a personal account connected the tunnel is pointless and stays off.
+ * Runs a verified Cloudflare WARP tunnel for the server's outbound traffic. wireproxy ships as libwireproxy.so (a
+ * static Go binary, executed straight from the native library directory) and exposes an HTTP CONNECT proxy on
+ * localhost that the Linux environment is pointed at. The tunnel is a network route, not a quota mechanism: the
+ * anonymous free-model limits are counted per IP and WARP egress addresses are shared, so nothing here reacts to
+ * quota errors - the only honest answers to a spent limit are waiting for the reset or a personal account.
  */
 class WarpManager(private val paths: Paths, private val prefs: Prefs) {
     enum class Phase { OFF, PREPARING, RUNNING, FAILED }
@@ -17,7 +18,6 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
     data class Status(
         val phase: Phase = Phase.OFF,
         val detail: String = "",
-        val rotations: Int = 0,
         val hasAccount: Boolean = false,
     )
 
@@ -34,21 +34,9 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
     @Volatile
     private var wantRunning = false
 
-    /** True while a rotation is in progress, so a limit-triggered storm collapses into one restart. */
-    @Volatile
-    private var rotating = false
-
-    /** Egress IP seen by the last successful probe. */
+    /** Egress IP seen by the last confirmed probe. */
     @Volatile
     private var lastIp: String? = null
-
-    /** When a limit report last started a rotation; reports closer together than [LIMIT_GAP_MS] are one event. */
-    @Volatile
-    private var lastLimitAt = 0L
-
-    /** When the tunnel was last reconnected; a second limit hit right after means the identity itself is burnt. */
-    @Volatile
-    private var lastRotateAt = 0L
 
     private val dir: File get() = File(paths.files, "warp")
     private val etcDir: File get() = File(dir, "etc")
@@ -57,8 +45,8 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
     private val logFile: File get() = File(dir, "wireproxy.log")
     private val binary: File get() = File(paths.nativeLibDir, "libwireproxy.so")
 
-    private fun update(phase: Phase, detail: String = status.detail, rotations: Int = status.rotations) {
-        status = Status(phase, detail, rotations, accountFile.exists())
+    private fun update(phase: Phase, detail: String = status.detail) {
+        status = Status(phase, detail, accountFile.exists())
         listeners.forEach { it(status) }
     }
 
@@ -69,8 +57,11 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
         return { listeners.remove(listener) }
     }
 
-    /** WARP makes sense only for the shared anonymous pool: enabled and no personal account on the profile. */
-    fun wantedFor(profile: Profile): Boolean = prefs.warpEnabled && profile.account == null && binary.exists()
+    /** WARP is required for a local anonymous profile whenever the (explicitly enabled) setting is on. */
+    fun requiredFor(profile: Profile): Boolean = prefs.warpEnabled && profile.account == null
+
+    /** The requirement can only be met when the native tunnel binary is present. */
+    fun wantedFor(profile: Profile): Boolean = requiredFor(profile) && binary.exists()
 
     /** True when the HTTP proxy on localhost accepts connections right now. */
     fun listening(): Boolean = runCatching {
@@ -86,13 +77,17 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
         if (!wantedFor(profile)) {
             stop("WARP is off for this profile")
 
+            if (requiredFor(profile)) {
+                update(Phase.FAILED, tr("В сборке отсутствует бинарник WARP", "The WARP binary is missing from this build"))
+            }
+
             return null
         }
 
         synchronized(lock) {
             // An open port is not a working tunnel (wireproxy listens even when the handshake never completes, and a
-            // stranger may hold the port): only a request that comes back counts.
-            if (listening() && Warp.probe()?.also { lastIp = it.ip } != null) {
+            // stranger may hold the port): only a request Cloudflare confirms as WARP-carried counts.
+            if (listening() && Warp.confirmedTrace(Warp.probe())?.also { lastIp = it.ip } != null) {
                 update(Phase.RUNNING)
 
                 return Warp.PROXY_URL
@@ -127,154 +122,6 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
     /** Starts the tunnel if it is not running. Safe to call from the UI; the work happens on a worker thread. */
     fun startAsync(profile: Profile) {
         Thread({ prepare(profile) }, "warp-start").apply { isDaemon = true; start() }
-    }
-
-    /**
-     * Reconnects the tunnel so Cloudflare hands out a different egress IP. In-flight requests die; the next message
-     * from the person goes through the fresh IP. A reconnect right after the previous one did not lift the limit
-     * means the identity itself has burnt limits - then a whole new WARP account is registered instead.
-     */
-    fun rotate(reason: String, onDone: ((Boolean) -> Unit)? = null) {
-        val escalate: Boolean
-
-        synchronized(lock) {
-            if (!accountFile.exists() || rotating) {
-                onDone?.invoke(false)
-
-                return
-            }
-
-            escalate = System.currentTimeMillis() - lastRotateAt < 180_000
-            lastRotateAt = System.currentTimeMillis()
-
-            if (escalate) {
-                Log.i("warp", "rotation escalated to a new identity ($reason)")
-            }
-
-            rotating = true
-        }
-
-        if (escalate) {
-            Thread({
-                var ok = false
-
-                synchronized(lock) {
-                    val wasRunning = listening()
-
-                    try {
-                        stopLocked()
-                        accountFile.delete()
-                        confFile.delete()
-                        ensureAccount()
-
-                        if (wasRunning) {
-                            bringUp()
-                            update(Phase.RUNNING, tr("Новый IP: учётная запись WARP пересоздана", "New IP: the WARP identity was rebuilt"), status.rotations + 1)
-                        } else {
-                            update(Phase.OFF, tr("Учётная запись WARP пересоздана", "The WARP identity was rebuilt"), status.rotations + 1)
-                        }
-
-                        ok = true
-
-                        Log.i("warp", "rotated via re-register: $reason")
-                    } catch (e: Exception) {
-                        Log.w("warp", "rotation (re-register) failed: ${e.message}")
-                        update(Phase.FAILED, e.message ?: "rotation failed", status.rotations + 1)
-                    } finally {
-                        rotating = false
-                    }
-                }
-
-                onDone?.invoke(ok)
-            }, "warp-rotate-new").apply { isDaemon = true; start() }
-
-            return
-        }
-
-        Thread({
-            var ok = false
-
-            synchronized(lock) {
-                try {
-                    val before = lastIp
-
-                    stopLocked()
-                    bringUp()
-
-                    // Same egress address after the reconnect: the limit would stay, so the identity itself is replaced.
-                    if (before != null && lastIp == before) {
-                        Log.i("warp", "the IP did not change after a reconnect, registering a new identity ($reason)")
-                        stopLocked()
-                        accountFile.delete()
-                        confFile.delete()
-                        ensureAccount()
-                        bringUp()
-                    }
-
-                    ok = true
-
-                    Log.i("warp", "rotated: $reason, ip=$lastIp")
-                    update(Phase.RUNNING, tr("IP обновлён", "IP refreshed"), status.rotations + 1)
-                } catch (e: Exception) {
-                    Log.w("warp", "rotation failed: ${e.message}")
-                    runCatching { process?.destroy() }
-                    process = null
-                    update(Phase.FAILED, e.message ?: "rotation failed", status.rotations + 1)
-                } finally {
-                    rotating = false
-                }
-            }
-
-            onDone?.invoke(ok)
-        }, "warp-rotate").apply { isDaemon = true; start() }
-    }
-
-    /**
-     * A limit error was seen (by the page or by the event stream). Starts a rotation unless one just did, and says
-     * whether it did. Blocks on a TCP probe: call from a worker thread. Two reports within [LIMIT_GAP_MS] count once,
-     * a second report within the escalation window then replaces the whole identity.
-     */
-    fun onLimit(reason: String, onDone: ((Boolean) -> Unit)? = null): Boolean {
-        val now = System.currentTimeMillis()
-
-        if (now - lastLimitAt < LIMIT_GAP_MS || !accountFile.exists() || !listening()) return false
-
-        lastLimitAt = now
-        rotate(reason, onDone)
-
-        return true
-    }
-
-    /** Throws away the current identity and registers a new one; restarts the tunnel when it was running. */
-    fun reRegister(onDone: ((Boolean) -> Unit)? = null) {
-        Thread({
-            var ok = false
-
-            synchronized(lock) {
-                val wasRunning = listening()
-
-                try {
-                    stopLocked()
-                    accountFile.delete()
-                    confFile.delete()
-                    ensureAccount()
-
-                    if (wasRunning) {
-                        bringUp()
-                        update(Phase.RUNNING, tr("Новая учётная запись WARP", "New WARP identity"))
-                    } else {
-                        update(Phase.OFF, tr("Новая учётная запись WARP", "New WARP identity"))
-                    }
-
-                    ok = true
-                } catch (e: Exception) {
-                    Log.w("warp", "re-register failed: ${e.message}")
-                    update(Phase.FAILED, e.message ?: "re-register failed")
-                }
-            }
-
-            onDone?.invoke(ok)
-        }, "warp-reregister").apply { isDaemon = true; start() }
     }
 
     /** Stops the tunnel; called when a profile with an account goes active or the service shuts down. */
@@ -374,7 +221,7 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
                 if (!wantRunning) return@Thread
 
                 synchronized(lock) {
-                    if (!wantRunning || rotating || process != null) return@synchronized
+                    if (!wantRunning || process != null) return@synchronized
 
                     try {
                         update(Phase.PREPARING, tr("Перезапускаю туннель...", "Restarting the tunnel..."))
@@ -405,7 +252,7 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
         var trace: Warp.Trace? = null
 
         for (attempt in 1..3) {
-            trace = Warp.probe()
+            trace = Warp.confirmedTrace(Warp.probe())
 
             if (trace != null) break
 
@@ -418,8 +265,8 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
 
         val found = trace ?: throw IllegalStateException(
             tr(
-                "Туннель поднят, но трафик не идёт (возможно, сеть блокирует WireGuard)",
-                "The tunnel is up but carries no traffic (the network may block WireGuard)",
+                "Туннель поднят, но трафик не подтверждён Cloudflare (возможно, сеть блокирует WireGuard)",
+                "The tunnel is up but Cloudflare did not confirm traffic (the network may block WireGuard)",
             ),
         )
 
@@ -440,10 +287,5 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
         }
 
         throw IllegalStateException(tr("Туннель не ответил вовремя", "The tunnel did not answer in time"))
-    }
-
-    companion object {
-        /** Limit reports closer together than this are the same event (a page full of identical errors). */
-        const val LIMIT_GAP_MS = 20_000L
     }
 }

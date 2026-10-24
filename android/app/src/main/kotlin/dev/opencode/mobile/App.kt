@@ -24,6 +24,9 @@ class App : Application() {
     lateinit var warp: WarpManager
         private set
 
+    lateinit var vpn: VpnSubscriptionManager
+        private set
+
     private var started = 0
 
     /** True while any of the app's screens is visible. Notifications are only needed when it is not. */
@@ -55,6 +58,8 @@ class App : Application() {
         ota = OtaManager(this, paths, prefs)
         Log.setStage("Application.onCreate: initializing WARP")
         warp = WarpManager(paths, prefs)
+        Log.setStage("Application.onCreate: initializing VPN subscriptions")
+        vpn = VpnSubscriptionManager(paths, prefs)
         // A device with a broken notification service must still let the app open; startForeground failures are
         // handled where they happen.
         Log.setStage("Application.onCreate: initializing notifications")
