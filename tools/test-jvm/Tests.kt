@@ -1066,6 +1066,72 @@ fun testWarp() {
     check("required route accepts a verified proxy", Warp.proxySatisfiesRequirement(true, Warp.PROXY_URL))
     check("optional route permits direct mode", Warp.proxySatisfiesRequirement(false, null))
 
+    // Resolver failures cannot differ between client versions; everything else can (a new route, a new attempt).
+    check(
+        "dns failure recognized",
+        Warp.isDnsFailure("Unable to resolve host \"api.cloudflareclient.com\": No address associated with hostname") &&
+            Warp.isDnsFailure("unknownhost: api.cloudflareclient.com") &&
+            Warp.isDnsFailure("java.net.UnknownHostException: eai_again"),
+    )
+    check("timeout is not a dns failure", !Warp.isDnsFailure("Read timed out"))
+    check("http error is not a dns failure", !Warp.isDnsFailure("HTTP 403"))
+    check("null message is not a dns failure", !Warp.isDnsFailure(null))
+
+    // A transport error on one client version falls through to the next instead of escaping the loop.
+    val retryCalls = ArrayList<String>()
+    val retryTransport = object : Warp.Transport {
+        override fun post(url: String, body: String, headers: Map<String, String>): Warp.Reply {
+            retryCalls += headers.getValue("CF-Client-Version")
+
+            if (retryCalls.size == 1) throw java.io.IOException("Read timed out")
+
+            return Warp.Reply(200, reply)
+        }
+    }
+
+    val retried = Warp.register(retryTransport, privA, pubA)
+
+    eq("register survived a transport error", retried.id, "warp-id-1")
+    eq("register retried on the next client version", retryCalls, listOf(Warp.CLIENT_VERSIONS[0], Warp.CLIENT_VERSIONS[1]))
+
+    // A dead resolver fails at once: no point burning the remaining client versions on the same DNS.
+    val dnsCalls = ArrayList<String>()
+    val dnsTransport = object : Warp.Transport {
+        override fun post(url: String, body: String, headers: Map<String, String>): Warp.Reply {
+            dnsCalls += headers.getValue("CF-Client-Version")
+
+            throw java.io.IOException("Unable to resolve host \"api.cloudflareclient.com\": No address associated with hostname")
+        }
+    }
+
+    val dnsError = runCatching { Warp.register(dnsTransport, privA, pubA) }.exceptionOrNull()
+
+    check("register fails fast on dns", dnsError is Warp.RegistrationException)
+    eq("register did not retry dns", dnsCalls.size, 1)
+
+    // The orphan sweep: a leftover wireproxy of an earlier app run runs from a different (deleted) install path,
+    // so the match is on the file name, never on the full path - and never on this process itself.
+    val procEntries = listOf(
+        10 to "/data/app/~~x1/dev.opencode.mobile-A/lib/arm64/libwireproxy.so\u0000-c\u0000conf\u0000--silent",
+        11 to "/data/app/~~x0/dev.opencode.mobile-OLD/lib/arm64/libwireproxy.so\u0000-c\u0000conf",
+        12 to "/data/app/~~x1/dev.opencode.mobile-A/lib/arm64/libproot.so\u0000--kill-on-exit",
+        13 to "libwireproxy.so\u0000-c\u0000conf",
+        14 to "",
+    )
+
+    eq("sweep finds every wireproxy", Warp.wireproxyPids(procEntries.asSequence(), 1), listOf(10, 11, 13))
+    eq("sweep never kills itself", Warp.wireproxyPids(procEntries.asSequence(), 10), listOf(11, 13))
+    eq("sweep empty table", Warp.wireproxyPids(emptySequence<Pair<Int, String>>(), 1), emptyList<Int>())
+
+    // The quoted tail of a tunnel log: the last lines within the cap, blank lines dropped.
+    val longLog = (1..60).joinToString("\n") { "line $it" }
+
+    check("log tail keeps the newest lines", Warp.logTail(longLog, 40).lines().first().let { it.startsWith("line 5") })
+    check("log tail respects the cap", Warp.logTail(longLog, 40).length <= 40)
+    check("log tail keeps whole lines", Warp.logTail("a\nb\nc", 40) == "a\nb\nc")
+    eq("log tail empty log", Warp.logTail("", 40), "")
+    eq("log tail blank log", Warp.logTail(" \n\n", 40), "")
+
     // Limit recognition on the event stream.
     check("free limit event", Limits.carriesLimit("session.step.failed", "{\"error\":{\"type\":\"provider.free-limit\",\"message\":\"Free usage limit reached\"}}"))
     check("rate limit event", Limits.carriesLimit("session.step.failed", "{\"error\":{\"type\":\"provider.rate-limit\",\"status\":429}}"))

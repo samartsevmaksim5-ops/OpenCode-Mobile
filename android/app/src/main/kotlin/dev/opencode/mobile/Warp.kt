@@ -184,11 +184,23 @@ object Warp {
         var lastError = "no answer"
 
         for (version in CLIENT_VERSIONS) {
-            val reply = transport.post(
-                "$API_BASE/v0a2158/reg",
-                payload,
-                mapOf("Content-Type" to "application/json", "CF-Client-Version" to version, "User-Agent" to USER_AGENT),
-            )
+            val reply = try {
+                transport.post(
+                    "$API_BASE/v0a2158/reg",
+                    payload,
+                    mapOf("Content-Type" to "application/json", "CF-Client-Version" to version, "User-Agent" to USER_AGENT),
+                )
+            } catch (e: Exception) {
+                val message = e.message ?: e.javaClass.simpleName
+
+                // A name that does not resolve will not start resolving between client versions: fail now instead of
+                // burning three full timeouts on the same dead DNS.
+                if (isDnsFailure(message)) throw RegistrationException(message)
+
+                lastError = message
+
+                continue
+            }
 
             if (reply.code in 200..299) return parseRegistration(reply.body, privateKey)
 
@@ -200,6 +212,17 @@ object Warp {
         }
 
         throw RegistrationException(lastError)
+    }
+
+    /** True for resolver failures: they cannot differ between client versions, so retrying the rest is wasted minutes. */
+    fun isDnsFailure(message: String?): Boolean {
+        val text = message?.lowercase() ?: return false
+
+        return "unable to resolve host" in text ||
+            "no address associated with hostname" in text ||
+            "unknownhost" in text ||
+            "enotfound" in text ||
+            "eai_again" in text
     }
 
     /** Pulls the WireGuard parameters out of a registration reply; missing pieces fail loudly, never silently. */
@@ -343,6 +366,35 @@ object Warp {
     fun proxySatisfiesRequirement(required: Boolean, proxy: String?): Boolean = !required || !proxy.isNullOrBlank()
 
     /**
+     * PIDs (from a pid-to-cmdline table, the first token NUL-separated as /proc lays it out) that run this app's
+     * wireproxy. Matched by file name rather than the full path, because an orphan from an earlier install of the
+     * app runs from a different randomized data directory that no longer exists, yet still holds the tunnel's ports.
+     */
+    fun wireproxyPids(entries: Sequence<Pair<Int, String>>, selfPid: Int): List<Int> =
+        entries.filter { (pid, cmd) -> pid != selfPid && cmd.substringBefore('\u0000').substringAfterLast('/') == "libwireproxy.so" }
+            .map { it.first }
+            .toList()
+
+    /**
+     * The last non-empty lines of a tunnel log, capped to [maxChars] from the tail: what a failure quotes so the
+     * person can see wireproxy's own reason ("bind: address already in use" and friends) instead of a guess.
+     */
+    fun logTail(log: String, maxChars: Int = 480): String {
+        val lines = log.lines().filter { it.isNotBlank() }
+        val kept = ArrayList<String>()
+        var size = 0
+
+        for (line in lines.asReversed()) {
+            if (size + line.length + 1 > maxChars) break
+
+            kept.add(0, line)
+            size += line.length + 1
+        }
+
+        return kept.joinToString("\n")
+    }
+
+    /**
      * Sends one real request through the local HTTP proxy. wireproxy opens its listening port even when the WireGuard
      * handshake never completes, so only a request that comes back proves the tunnel carries traffic. Null on failure.
      */
@@ -368,7 +420,7 @@ object Warp {
     }
 
     /** The HTTP transport used on device. */
-    class HttpTransport(private val timeoutMs: Int = 15_000) : Transport {
+    class HttpTransport(private val timeoutMs: Int = 10_000) : Transport {
         override fun post(url: String, body: String, headers: Map<String, String>): Reply {
             val connection = URL(url).openConnection() as HttpURLConnection
 

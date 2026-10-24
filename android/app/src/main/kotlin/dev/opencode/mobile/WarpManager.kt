@@ -1,6 +1,10 @@
 package dev.opencode.mobile
 
+import android.os.Handler
+import android.os.Looper
+import android.os.Process as AndroidProcess
 import java.io.File
+import java.io.RandomAccessFile
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.CopyOnWriteArrayList
@@ -23,6 +27,9 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
 
     private val listeners = CopyOnWriteArrayList<(Status) -> Unit>()
 
+    /** Status changes reach the UI through this, whatever thread moved the tunnel forward. */
+    private val main = Handler(Looper.getMainLooper())
+
     @Volatile
     var status: Status = Status()
         private set
@@ -30,6 +37,12 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
     private val lock = Object()
 
     private var process: Process? = null
+
+    /** Bumped by every start: only the newest process's watcher owns the respawn, so two dead processes cannot race. */
+    private var generation = 0L
+
+    /** Where wireproxy's log stood when the current process started, so a failure quotes only that process. */
+    private var logMark = 0L
 
     @Volatile
     private var wantRunning = false
@@ -47,12 +60,23 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
 
     private fun update(phase: Phase, detail: String = status.detail) {
         status = Status(phase, detail, accountFile.exists())
-        listeners.forEach { it(status) }
+
+        // Settings renders its whole screen on every change, so it must run on the UI thread - and a listener that
+        // throws must never take the tunnel lifecycle (or the server start that called prepare) down with it. That
+        // is exactly how "Can't create handler inside Thread[server-worker]" killed the first start of 1.0.7.
+        for (listener in listeners) {
+            val snapshot = status
+
+            main.post {
+                runCatching { listener(snapshot) }.onFailure { Log.w("warp", "status listener failed: ${it.message}") }
+            }
+        }
     }
 
     fun listen(listener: (Status) -> Unit): () -> Unit {
         listeners.add(listener)
-        listener(status)
+
+        runCatching { listener(status) }.onFailure { Log.w("warp", "status listener failed: ${it.message}") }
 
         return { listeners.remove(listener) }
     }
@@ -64,8 +88,10 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
     fun wantedFor(profile: Profile): Boolean = requiredFor(profile) && binary.exists()
 
     /** True when the HTTP proxy on localhost accepts connections right now. */
-    fun listening(): Boolean = runCatching {
-        Socket().use { it.connect(InetSocketAddress("127.0.0.1", Warp.HTTP_PORT), 400) }
+    fun listening(): Boolean = portOpen(Warp.HTTP_PORT)
+
+    private fun portOpen(port: Int): Boolean = runCatching {
+        Socket().use { it.connect(InetSocketAddress("127.0.0.1", port), 400) }
         true
     }.getOrDefault(false)
 
@@ -85,18 +111,21 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
         }
 
         synchronized(lock) {
-            // An open port is not a working tunnel (wireproxy listens even when the handshake never completes, and a
-            // stranger may hold the port): only a request Cloudflare confirms as WARP-carried counts.
-            if (listening() && Warp.confirmedTrace(Warp.probe())?.also { lastIp = it.ip } != null) {
+            // Our own live tunnel that still carries confirmed WARP traffic is adopted as is; anything else on the
+            // port is replaced. An open port alone proves nothing (wireproxy listens even when the handshake never
+            // completes, and a stranger may hold it).
+            val own = process
+
+            if (own != null && own.isAlive && listening() && Warp.confirmedTrace(Warp.probe())?.also { lastIp = it.ip } != null) {
                 update(Phase.RUNNING)
 
                 return Warp.PROXY_URL
             }
 
-            if (process != null) {
-                stopLocked()
-                Thread.sleep(500)
-            }
+            // The port holder is not a working tunnel of ours: kill it. An orphaned wireproxy of an earlier app run
+            // (the app died without cleanup) keeps listening forever, and every new process dies on "address already
+            // in use" the moment it starts - the "tunnel exited while starting" loop of 1.0.7.
+            stopAndSweep()
 
             update(Phase.PREPARING, tr("Поднимаем туннель WARP...", "Bringing up the WARP tunnel..."))
 
@@ -109,8 +138,10 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
 
                 return Warp.PROXY_URL
             } catch (e: Exception) {
-                Log.w("warp", "prepare failed: ${e.message}")
-                update(Phase.FAILED, e.message ?: "failed")
+                val detail = failureDetail(e.message ?: "failed")
+
+                Log.w("warp", "prepare failed: $detail")
+                update(Phase.FAILED, detail)
                 runCatching { process?.destroy() }
                 process = null
 
@@ -127,9 +158,9 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
     /** Stops the tunnel; called when a profile with an account goes active or the service shuts down. */
     fun stop(reason: String) {
         synchronized(lock) {
-            if (process == null && status.phase == Phase.OFF) return
+            if (process == null && status.phase == Phase.OFF && !portOpen(Warp.HTTP_PORT) && !portOpen(Warp.SOCKS_PORT)) return
 
-            stopLocked()
+            stopAndSweep(waitForPorts = false)
             update(Phase.OFF, reason)
         }
     }
@@ -140,6 +171,52 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
         runCatching { process?.destroy() }
 
         process = null
+    }
+
+    /** Stops the tracked tunnel and every leftover wireproxy of this installation, then waits for the ports. */
+    private fun stopAndSweep(waitForPorts: Boolean = true) {
+        stopLocked()
+
+        val killed = sweep()
+
+        if (killed > 0) Log.i("warp", "stopped $killed leftover wireproxy process(es) from earlier runs")
+
+        if (waitForPorts) awaitPortsFree()
+    }
+
+    /** Kills every wireproxy of this app it can find in /proc, tracked or orphaned by an earlier app run. */
+    private fun sweep(): Int {
+        val me = AndroidProcess.myPid()
+
+        val entries = sequence {
+            for (entry in File("/proc").listFiles().orEmpty()) {
+                val pid = entry.name.toIntOrNull() ?: continue
+                val cmd = try {
+                    File(entry, "cmdline").readBytes().toString(Charsets.ISO_8859_1)
+                } catch (_: Exception) {
+                    continue
+                }
+
+                yield(pid to cmd)
+            }
+        }
+
+        val pids = Warp.wireproxyPids(entries, me)
+
+        for (pid in pids) runCatching { AndroidProcess.killProcess(pid) }
+
+        return pids.size
+    }
+
+    /** Waits until both tunnel ports are actually released; a kill is asynchronous and the bind would fail otherwise. */
+    private fun awaitPortsFree(timeoutMs: Long = 3_000) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+
+        while (System.currentTimeMillis() < deadline) {
+            if (!portOpen(Warp.SOCKS_PORT) && !portOpen(Warp.HTTP_PORT)) return
+
+            Thread.sleep(150)
+        }
     }
 
     private fun load(): Warp.Account? = Warp.loadAccount(accountFile)
@@ -188,24 +265,31 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
 
         wantRunning = true
 
+        // Only what this process prints is the evidence for a failure; earlier runs stay behind the mark.
+        logMark = logFile.length()
+
         val builder = ProcessBuilder(binary.path, "-c", confFile.path, "--silent")
 
         builder.redirectErrorStream(true)
         builder.redirectOutput(ProcessBuilder.Redirect.appendTo(logFile))
 
-        process = builder.start()
+        val started = builder.start()
+
+        process = started
+
+        val myGeneration = ++generation
 
         // Watch for an early death (bad config, port busy) so the status stops pretending - and bring the tunnel
         // back: a dead wireproxy under a live server means every model request dies with connection refused until
         // the next server restart, with nothing in the interface hinting at the real cause.
-        val watcher = process
-
         Thread({
-            val code = runCatching { watcher?.waitFor() }.getOrNull() ?: return@Thread
+            val code = runCatching { started.waitFor() }.getOrNull() ?: return@Thread
 
-            if (watcher !== process) return@Thread
+            synchronized(lock) {
+                if (process !== started || generation != myGeneration) return@Thread
 
-            synchronized(lock) { if (watcher === process) process = null }
+                process = null
+            }
 
             if (!wantRunning) {
                 update(Phase.OFF, tr("Туннель остановлен", "Tunnel stopped"))
@@ -213,7 +297,11 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
                 return@Thread
             }
 
-            update(Phase.FAILED, tr("Туннель завершился (код ", "The tunnel exited (code ") + code + ")")
+            val reason = tr("Туннель завершился (код ", "The tunnel exited (code ") + code + ")"
+            val detail = failureDetail(reason)
+
+            Log.w("warp", detail)
+            update(Phase.FAILED, detail)
 
             for (attempt in 1..3) {
                 Thread.sleep(if (attempt == 1) 2_000L else 10_000L)
@@ -221,7 +309,8 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
                 if (!wantRunning) return@Thread
 
                 synchronized(lock) {
-                    if (!wantRunning || process != null) return@synchronized
+                    // A newer start owns recovery now (another respawn chain or a fresh prepare); this watcher retires.
+                    if (!wantRunning || process != null || generation != myGeneration) return@Thread
 
                     try {
                         update(Phase.PREPARING, tr("Перезапускаю туннель...", "Restarting the tunnel..."))
@@ -229,10 +318,12 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
                         update(Phase.RUNNING, tr("WARP активен", "WARP is active"))
                         Log.i("warp", "tunnel respawned (attempt $attempt) after exit code $code")
                     } catch (e: Exception) {
-                        Log.w("warp", "tunnel respawn failed (attempt $attempt): ${e.message}")
+                        val failed = failureDetail(e.message ?: "respawn failed")
+
+                        Log.w("warp", "tunnel respawn failed (attempt $attempt): $failed")
                         runCatching { process?.destroy() }
                         process = null
-                        update(Phase.FAILED, e.message ?: "respawn failed")
+                        update(Phase.FAILED, failed)
                     }
                 }
 
@@ -277,15 +368,39 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
         val deadline = System.currentTimeMillis() + timeoutMs
 
         while (System.currentTimeMillis() < deadline) {
-            if (listening()) return
-
             val p = process ?: throw IllegalStateException(tr("Туннель не запустился", "The tunnel did not start"))
 
+            // The process is checked before the port: a stranger (or an orphan of an earlier run) holding the port
+            // must not masquerade as this tunnel coming up while our process already died on the bind.
             if (!p.isAlive) throw IllegalStateException(tr("Туннель завершился при запуске", "The tunnel exited while starting"))
+
+            if (listening()) return
 
             Thread.sleep(300)
         }
 
         throw IllegalStateException(tr("Туннель не ответил вовремя", "The tunnel did not answer in time"))
     }
+
+    /** A failure the person can act on: the reason plus wireproxy's own words about it, from this run's log. */
+    private fun failureDetail(reason: String): String {
+        val tail = tailSinceMark()
+
+        return if (tail.isBlank()) reason else "$reason\n$tail"
+    }
+
+    /** What the current process printed after [logMark], capped to a few lines from the end. */
+    private fun tailSinceMark(): String = runCatching {
+        if (!logFile.exists() || logFile.length() <= logMark) return ""
+
+        RandomAccessFile(logFile, "r").use { raf ->
+            raf.seek(logMark)
+
+            val bytes = ByteArray((raf.length() - logMark).toInt())
+
+            raf.readFully(bytes)
+
+            Warp.logTail(bytes.toString(Charsets.UTF_8))
+        }
+    }.getOrDefault("")
 }

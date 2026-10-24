@@ -58,7 +58,9 @@ class SettingsActivity : Activity() {
         super.onStart()
         unsubscribeState = ServerState.listen { render() }
         unsubscribeUpdates = Updates.listen { render() }
-        unsubscribeWarp = app.warp.listen { render() }
+        // The warp manager reports from the server-start thread; the screen rebuilds itself on the UI thread only,
+        // or rendering mid-prepare throws "Can't create handler" and takes the server start down with it.
+        unsubscribeWarp = app.warp.listen { runOnUiThread { if (!isFinishing) render() } }
     }
 
     override fun onStop() {
