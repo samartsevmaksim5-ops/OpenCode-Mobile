@@ -232,13 +232,13 @@ class OtaManager(private val context: Context, private val paths: Paths, private
      * the directory of the build to run, or null for the one bundled in the app.
      */
     @Synchronized
-    fun prepareStart(profile: Profile, apply: Boolean): File? {
+    fun prepareStart(profile: Profile, apply: Boolean, auto: Boolean = true): File? {
         if (state.supersededBy(BuildConfig.RUNTIME_SEQ)) {
             Log.i("ota", "the bundled build is newer than the downloaded one; dropping the download")
             dropAll()
         }
 
-        if (state.staged != null && state.trial == null && (apply || prefs.otaAuto)) {
+        if (state.staged != null && state.trial == null && (apply || (auto && prefs.otaAuto))) {
             if (backup(profile)) {
                 state.promote()
                 Log.i("ota", "switching to ${state.current}")

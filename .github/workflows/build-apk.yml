@@ -196,7 +196,8 @@ jobs:
       - name: Version
         id: ver
         run: |
-          if [ "${GITHUB_REF_TYPE}" = tag ]; then name="${GITHUB_REF_NAME#v}"; else name="1.0.6"; fi
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then name="${GITHUB_REF_NAME#v}"; else name="$(sed -n 's/.*VERSION_NAME") ?: "\([0-9][0-9.]*\)".*/\1/p' android/app/build.gradle.kts | head -1)"; fi
+          [ -n "$name" ] || { echo "::error::could not read the default version from android/app/build.gradle.kts"; exit 1; }
           # Minutes since the epoch: always increases, and stays far below the 2^31 limit of a version code.
           code=$(( $(date +%s) / 60 ))
           echo "name=$name" >> "$GITHUB_OUTPUT"

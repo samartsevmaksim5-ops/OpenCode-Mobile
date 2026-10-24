@@ -38,6 +38,14 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
     @Volatile
     private var rotating = false
 
+    /** Egress IP seen by the last successful probe. */
+    @Volatile
+    private var lastIp: String? = null
+
+    /** When a limit report last started a rotation; reports closer together than [LIMIT_GAP_MS] are one event. */
+    @Volatile
+    private var lastLimitAt = 0L
+
     /** When the tunnel was last reconnected; a second limit hit right after means the identity itself is burnt. */
     @Volatile
     private var lastRotateAt = 0L
@@ -82,18 +90,24 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
         }
 
         synchronized(lock) {
-            if (listening()) {
+            // An open port is not a working tunnel (wireproxy listens even when the handshake never completes, and a
+            // stranger may hold the port): only a request that comes back counts.
+            if (listening() && Warp.probe()?.also { lastIp = it.ip } != null) {
                 update(Phase.RUNNING)
 
                 return Warp.PROXY_URL
+            }
+
+            if (process != null) {
+                stopLocked()
+                Thread.sleep(500)
             }
 
             update(Phase.PREPARING, tr("Поднимаем туннель WARP...", "Bringing up the WARP tunnel..."))
 
             try {
                 ensureAccount()
-                startProcess()
-                waitListening()
+                bringUp()
 
                 Log.i("warp", "tunnel up, endpoint=${load()?.endpoint}")
                 update(Phase.RUNNING, tr("WARP активен", "WARP is active"))
@@ -154,8 +168,7 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
                         ensureAccount()
 
                         if (wasRunning) {
-                            startProcess()
-                            waitListening()
+                            bringUp()
                             update(Phase.RUNNING, tr("Новый IP: учётная запись WARP пересоздана", "New IP: the WARP identity was rebuilt"), status.rotations + 1)
                         } else {
                             update(Phase.OFF, tr("Учётная запись WARP пересоздана", "The WARP identity was rebuilt"), status.rotations + 1)
@@ -183,15 +196,29 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
 
             synchronized(lock) {
                 try {
+                    val before = lastIp
+
                     stopLocked()
-                    startProcess()
-                    waitListening()
+                    bringUp()
+
+                    // Same egress address after the reconnect: the limit would stay, so the identity itself is replaced.
+                    if (before != null && lastIp == before) {
+                        Log.i("warp", "the IP did not change after a reconnect, registering a new identity ($reason)")
+                        stopLocked()
+                        accountFile.delete()
+                        confFile.delete()
+                        ensureAccount()
+                        bringUp()
+                    }
+
                     ok = true
 
-                    Log.i("warp", "rotated: $reason")
+                    Log.i("warp", "rotated: $reason, ip=$lastIp")
                     update(Phase.RUNNING, tr("IP обновлён", "IP refreshed"), status.rotations + 1)
                 } catch (e: Exception) {
                     Log.w("warp", "rotation failed: ${e.message}")
+                    runCatching { process?.destroy() }
+                    process = null
                     update(Phase.FAILED, e.message ?: "rotation failed", status.rotations + 1)
                 } finally {
                     rotating = false
@@ -200,6 +227,22 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
 
             onDone?.invoke(ok)
         }, "warp-rotate").apply { isDaemon = true; start() }
+    }
+
+    /**
+     * A limit error was seen (by the page or by the event stream). Starts a rotation unless one just did, and says
+     * whether it did. Blocks on a TCP probe: call from a worker thread. Two reports within [LIMIT_GAP_MS] count once,
+     * a second report within the escalation window then replaces the whole identity.
+     */
+    fun onLimit(reason: String, onDone: ((Boolean) -> Unit)? = null): Boolean {
+        val now = System.currentTimeMillis()
+
+        if (now - lastLimitAt < LIMIT_GAP_MS || !accountFile.exists() || !listening()) return false
+
+        lastLimitAt = now
+        rotate(reason, onDone)
+
+        return true
     }
 
     /** Throws away the current identity and registers a new one; restarts the tunnel when it was running. */
@@ -217,8 +260,7 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
                     ensureAccount()
 
                     if (wasRunning) {
-                        startProcess()
-                        waitListening()
+                        bringUp()
                         update(Phase.RUNNING, tr("Новая учётная запись WARP", "New WARP identity"))
                     } else {
                         update(Phase.OFF, tr("Новая учётная запись WARP", "New WARP identity"))
@@ -336,8 +378,7 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
 
                     try {
                         update(Phase.PREPARING, tr("Перезапускаю туннель...", "Restarting the tunnel..."))
-                        startProcess()
-                        waitListening()
+                        bringUp()
                         update(Phase.RUNNING, tr("WARP активен", "WARP is active"))
                         Log.i("warp", "tunnel respawned (attempt $attempt) after exit code $code")
                     } catch (e: Exception) {
@@ -351,6 +392,38 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
                 if (status.phase == Phase.RUNNING) return@Thread
             }
         }, "warp-watch").apply { isDaemon = true; start() }
+    }
+
+    private fun bringUp() {
+        startProcess()
+        waitListening()
+        verifyTunnel()
+    }
+
+    /** Proves the tunnel carries traffic and remembers its egress IP, so a rotation can tell whether the IP changed. */
+    private fun verifyTunnel() {
+        var trace: Warp.Trace? = null
+
+        for (attempt in 1..3) {
+            trace = Warp.probe()
+
+            if (trace != null) break
+
+            val p = process
+
+            if (p != null && !p.isAlive) throw IllegalStateException(tr("Туннель завершился при запуске", "The tunnel exited while starting"))
+
+            if (attempt < 3) Thread.sleep(2_000)
+        }
+
+        val found = trace ?: throw IllegalStateException(
+            tr(
+                "Туннель поднят, но трафик не идёт (возможно, сеть блокирует WireGuard)",
+                "The tunnel is up but carries no traffic (the network may block WireGuard)",
+            ),
+        )
+
+        lastIp = found.ip
     }
 
     private fun waitListening(timeoutMs: Long = 12_000) {
@@ -367,5 +440,10 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
         }
 
         throw IllegalStateException(tr("Туннель не ответил вовремя", "The tunnel did not answer in time"))
+    }
+
+    companion object {
+        /** Limit reports closer together than this are the same event (a page full of identical errors). */
+        const val LIMIT_GAP_MS = 20_000L
     }
 }

@@ -2,7 +2,7 @@
 # Fetches the static wireproxy binary (a userspace WireGuard client that exposes SOCKS5/HTTP proxies) for the WARP
 # tunnel and places it into the jniLibs directory under its Android library name, so the APK extracts it into the
 # native library directory where executing it is allowed.
-# Usage: tools/fetch-wireproxy.sh <out-dir>   (e.g. out/jniLibs/arm64-v8a)
+# Usage: runtime/fetch-wireproxy.sh <out-dir>   (e.g. out/jniLibs/arm64-v8a)
 set -euo pipefail
 
 dest="${1:?usage: fetch-wireproxy.sh <out-dir>}"

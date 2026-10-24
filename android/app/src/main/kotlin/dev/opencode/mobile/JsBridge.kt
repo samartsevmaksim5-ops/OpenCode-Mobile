@@ -67,24 +67,25 @@ class JsBridge(private val activity: MainActivity) {
         Thread {
             // Without a running tunnel (WARP off, or an account connected) there is nothing to refresh and the page
             // just shows the sign-in offer as before.
-            val up = runCatching { activity.app.warp.listening() }.getOrDefault(false)
-
-            if (!up) {
-                activity.runOnUiThread { Ui.toast(activity, tr("WARP не запущен — подключите аккаунт или включите WARP в настройках", "WARP is not running — connect an account or enable WARP in settings")) }
-                return@Thread
-            }
-
-            activity.app.warp.rotate("page limit error") { ok ->
-                activity.runOnUiThread {
-                    Ui.toast(
-                        activity,
-                        if (ok) {
-                            tr("WARP: IP обновлён, отправьте запрос ещё раз", "WARP: IP refreshed, send the request again")
-                        } else {
-                            tr("WARP не смог обновить IP", "WARP could not refresh the IP")
-                        },
-                    )
+            val started = runCatching {
+                activity.app.warp.onLimit("page limit error") { ok ->
+                    activity.runOnUiThread {
+                        Ui.toast(
+                            activity,
+                            if (ok) {
+                                tr("WARP: IP обновлён, отправьте запрос ещё раз", "WARP: IP refreshed, send the request again")
+                            } else {
+                                tr("WARP не смог обновить IP", "WARP could not refresh the IP")
+                            },
+                        )
+                    }
                 }
+            }.getOrDefault(false)
+
+            // Not started: no tunnel is running, or a rotation just ran for the same limit (the event stream or an
+            // earlier error on the page). Say something only for the first case.
+            if (!started && !runCatching { activity.app.warp.listening() }.getOrDefault(false)) {
+                activity.runOnUiThread { Ui.toast(activity, tr("WARP не запущен — подключите аккаунт или включите WARP в настройках", "WARP is not running — connect an account or enable WARP in settings")) }
             }
         }.start()
     }

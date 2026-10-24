@@ -122,6 +122,9 @@ object ProotCommand {
         if (!c.proxy.isNullOrEmpty()) {
             for (key in listOf("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")) env[key] = c.proxy
             for (key in listOf("NO_PROXY", "no_proxy")) env[key] = Warp.NO_PROXY
+            // The server is a Node executable: its built-in fetch (every model request) ignores the variables above
+            // unless this switch is on. Without it the tunnel would be up and carry nothing.
+            env["NODE_USE_ENV_PROXY"] = "1"
         }
 
         env.putAll(extra)

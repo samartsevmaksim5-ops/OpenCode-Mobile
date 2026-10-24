@@ -256,7 +256,7 @@
 
   // A person without a connected account hits a bare quota error as soon as the free models run out. Replace that
   // dead end with an offer to sign in, plus a button that opens the app's own sign-in screen.
-  var QUOTA = /(insufficient[_ ]?quota|quota\s*(?:exceeded|exhausted|has been exceeded|will run out|is exhausted)|exceeded\s+your\s+current\s+quota|exceeded\s*(?:your|the|its)?\s*(?:usage|quota|free)|plan\s+and\s+billing|(?:free|usage|request)\s*(?:quota|limit)|(?:credit|credits?|tokens?)\s*(?:exhausted|used up)|\b\u043a\u0432\u043e\u0442\w*\s*(?:\u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d\w*|\u043f\u0440\u0435\u0432\u044b\u0448\u0435\u043d\w*|\u0437\u0430\u043a\u043e\u043d\u0447\u0438\u043b\w*)|\b\u043b\u0438\u043c\u0438\u0442\w*\s*(?:\u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d\w*|\u043f\u0440\u0435\u0432\u044b\u0448\u0435\u043d\w*|\u0437\u0430\u043a\u043e\u043d\u0447\u0438\u043b\w*)|(?:\u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d\w*|\u0437\u0430\u043a\u043e\u043d\u0447\u0438\u043b\w*)\s*(?:\u043b\u0438\u043c\u0438\u0442\w*|\u043a\u0432\u043e\u0442\w*))/i;
+  var QUOTA = /(rate[\s_-]?limit(?:ed)?|too\s+many\s+requests|\b429\b|insufficient[_ ]?quota|quota\s*(?:exceeded|exhausted|has been exceeded|will run out|is exhausted)|exceeded\s+your\s+current\s+quota|exceeded\s*(?:your|the|its)?\s*(?:usage|quota|free)|plan\s+and\s+billing|(?:free|usage|request)\s*(?:quota|limit)|(?:credit|credits?|tokens?)\s*(?:exhausted|used up)|\b\u043a\u0432\u043e\u0442\w*\s*(?:\u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d\w*|\u043f\u0440\u0435\u0432\u044b\u0448\u0435\u043d\w*|\u0437\u0430\u043a\u043e\u043d\u0447\u0438\u043b\w*)|\b\u043b\u0438\u043c\u0438\u0442\w*\s*(?:\u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d\w*|\u043f\u0440\u0435\u0432\u044b\u0448\u0435\u043d\w*|\u0437\u0430\u043a\u043e\u043d\u0447\u0438\u043b\w*)|(?:\u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d\w*|\u0437\u0430\u043a\u043e\u043d\u0447\u0438\u043b\w*)\s*(?:\u043b\u0438\u043c\u0438\u0442\w*|\u043a\u0432\u043e\u0442\w*))/i;
   var quotaHandled = new WeakSet();
   var lastRotate = 0;
 
@@ -320,10 +320,10 @@
     quotaHandled.add(parent);
 
     // The tunnel rebuild gives a fresh Cloudflare egress IP, which resets the shared anonymous limits. Fire it once
-    // per cooldown so a page full of identical errors cannot hammer the reconnect, and only when a tunnel exists.
+    // per cooldown (native code merges bursts too, and a repeat within three minutes rebuilds the identity) so a page full of identical errors cannot hammer the reconnect, and only when a tunnel exists.
     var now = Date.now();
 
-    if (warpActive() && now - lastRotate > 180000) {
+    if (warpActive() && now - lastRotate > 20000) {
       lastRotate = now;
 
       try {

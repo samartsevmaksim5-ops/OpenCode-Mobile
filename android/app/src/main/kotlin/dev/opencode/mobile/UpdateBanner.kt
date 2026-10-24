@@ -74,6 +74,8 @@ object UpdateBanner {
             tr("- при упоре в лимит туннель сам пересоздаётся с новым IP — без ваших действий и без нового аккаунта", "- when a limit is hit the tunnel rebuilds itself with a fresh IP - no action from you, no new account needed"),
             tr("- вход по Google больше не навязывается: экран входа никогда не открывается сам, только по вашему нажатию", "- Google sign-in is never pushed on you: the sign-in screen only opens when you tap it"),
             tr("- исправлены падения «сервер постоянно падает»: проблемные устройства сами переключаются в совместимый режим", "- fixed the keeps crashing loop: affected devices switch to compatibility mode on their own"),
+            tr("- WARP теперь действительно проводит запросы сервера через туннель и проверяет, что трафик идёт; лимиты замечаются и в фоне", "- WARP now really carries the server's requests and checks that traffic flows; limits are noticed in the background too"),
+            tr("- сервер не падает в цикле: счётчик перезапусков сбрасывается, порт профиля больше не «уплывает»", "- no more crash loops: the restart budget resets, and a profile's port no longer drifts"),
         )) {
             card.addView(Ui.text(activity, line, 14f, palette.muted), Ui.params(bottom = Ui.dp(activity, 3)))
         }

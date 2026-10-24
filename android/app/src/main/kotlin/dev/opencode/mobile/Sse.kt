@@ -30,6 +30,10 @@ class SseParser(private val onEvent: (data: String) -> Unit) {
 
 /** The part of an OpenCode server event the app reacts to. */
 data class OcEvent(val id: String?, val type: String, val sessionId: String?) {
+    /** The whole event payload; kept out of equality on purpose. */
+    var raw: String = ""
+        private set
+
     companion object {
         const val SESSION_SUCCEEDED = "session.execution.succeeded"
         const val SESSION_FAILED = "session.execution.failed"
@@ -40,7 +44,7 @@ data class OcEvent(val id: String?, val type: String, val sessionId: String?) {
             val type = root["type"] as? String ?: return null
             val data = root["data"] as? Map<*, *>
 
-            return OcEvent(root["id"] as? String, type, data?.get("sessionID") as? String)
+            return OcEvent(root["id"] as? String, type, data?.get("sessionID") as? String).also { it.raw = json }
         }
     }
 }

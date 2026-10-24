@@ -203,7 +203,9 @@ class MainActivity : Activity(), UiHost {
                     startup.loading()
                     web.open(s.baseUrl, currentPassword())
 
-                    if (app.prefs.signedIn) firstRun()
+                    // Independent of sign-in: the battery prompt is what keeps the server alive in the background, and
+                    // most people never sign in.
+                    firstRun()
                 }
             }
         }

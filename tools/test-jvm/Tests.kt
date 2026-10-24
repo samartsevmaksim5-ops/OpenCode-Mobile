@@ -1045,7 +1045,24 @@ fun testWarp() {
     check("proxy env no_proxy", proxied["NO_PROXY"]?.contains("127.0.0.1") == true)
     check("proxy env lowercase", proxied["http_proxy"] == Warp.PROXY_URL)
 
+    // Node's built-in fetch only honours the proxy variables with this switch on.
+    eq("node env proxy switch", proxied["NODE_USE_ENV_PROXY"], "1")
+
+    // Cloudflare trace parsing: egress IP and whether WARP carried the request.
+    eq("trace parsed", Warp.parseTrace("fl=1\nip=104.28.1.2\nwarp=on\nloc=NL\n"), Warp.Trace("104.28.1.2", true))
+    eq("trace without warp", Warp.parseTrace("ip=1.2.3.4\nwarp=off\n"), Warp.Trace("1.2.3.4", false))
+    eq("trace without ip", Warp.parseTrace("warp=on\n"), null)
+
+    // Limit recognition on the event stream.
+    check("free limit event", Limits.carriesLimit("session.step.failed", "{\"error\":{\"type\":\"provider.free-limit\",\"message\":\"Free usage limit reached\"}}"))
+    check("rate limit event", Limits.carriesLimit("session.step.failed", "{\"error\":{\"type\":\"provider.rate-limit\",\"status\":429}}"))
+    check("retry status with rate limit", Limits.carriesLimit("session.status", "{\"status\":{\"type\":\"retry\",\"message\":\"Rate limit exceeded\"}}"))
+    check("unrelated event ignored", !Limits.carriesLimit("message.part.updated", "rate limit"))
+    check("plain failure ignored", !Limits.carriesLimit("session.step.failed", "{\"error\":{\"message\":\"file not found\"}}"))
+
     val direct = ProotCommand.guestEnv(cfg())
+
+    check("no node proxy switch without warp", direct["NODE_USE_ENV_PROXY"] == null)
 
     check("no proxy env without warp", direct.keys.none { it.equals("HTTP_PROXY", ignoreCase = true) })
 

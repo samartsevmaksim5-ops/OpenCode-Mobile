@@ -102,6 +102,14 @@ class EventWatcher(
             if (seen.size > 200) seen.remove(seen.first())
         }
 
+        // A used-up limit rotates the tunnel whether or not the page is open: the page cannot notice anything while
+        // the app sits in the background, which is exactly when long tasks run into the limit.
+        if (Limits.carriesLimit(event.type, event.raw)) {
+            val app = context.applicationContext as? App
+
+            if (app != null) runCatching { app.warp.onLimit("event ${event.type}") }
+        }
+
         if (!enabled() || inForeground()) return
 
         val key = event.sessionId ?: event.type

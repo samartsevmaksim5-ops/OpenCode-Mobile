@@ -314,6 +314,52 @@ object Warp {
         )
     }
 
+    /** What Cloudflare's trace page says about the connection that asked: the egress IP and whether WARP carried it. */
+    data class Trace(val ip: String, val warp: Boolean)
+
+    const val TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
+
+    /** Parses the key=value lines of /cdn-cgi/trace. Null when there is no ip line. */
+    fun parseTrace(text: String): Trace? {
+        val fields = HashMap<String, String>()
+
+        for (line in text.lines()) {
+            val eq = line.indexOf('=')
+
+            if (eq > 0) fields[line.substring(0, eq).trim()] = line.substring(eq + 1).trim()
+        }
+
+        val ip = fields["ip"]?.takeIf { it.isNotEmpty() } ?: return null
+        val warp = fields["warp"]?.let { it == "on" || it == "plus" } ?: false
+
+        return Trace(ip, warp)
+    }
+
+    /**
+     * Sends one real request through the local HTTP proxy. wireproxy opens its listening port even when the WireGuard
+     * handshake never completes, so only a request that comes back proves the tunnel carries traffic. Null on failure.
+     */
+    fun probe(port: Int = HTTP_PORT, timeoutMs: Int = 6_000): Trace? = try {
+        val proxy = java.net.Proxy(java.net.Proxy.Type.HTTP, java.net.InetSocketAddress("127.0.0.1", port))
+        val connection = URL(TRACE_URL).openConnection(proxy) as HttpURLConnection
+
+        try {
+            connection.connectTimeout = timeoutMs
+            connection.readTimeout = timeoutMs
+            connection.setRequestProperty("User-Agent", USER_AGENT)
+
+            if (connection.responseCode in 200..299) {
+                parseTrace(connection.inputStream.use { it.readBytes().toString(Charsets.UTF_8) })
+            } else {
+                null
+            }
+        } finally {
+            connection.disconnect()
+        }
+    } catch (_: Exception) {
+        null
+    }
+
     /** The HTTP transport used on device. */
     class HttpTransport(private val timeoutMs: Int = 15_000) : Transport {
         override fun post(url: String, body: String, headers: Map<String, String>): Reply {

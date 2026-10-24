@@ -39,6 +39,14 @@ class ServerService : Service() {
     @Volatile
     private var lastAliveAt = 0L
 
+    /** When the current run reached the healthy state; a long stretch from here resets the restart budget. */
+    @Volatile
+    private var runningSince = 0L
+
+    /** True while the running server was started with the WARP proxy in its environment. */
+    @Volatile
+    private var proxied = false
+
     /** Bumped on every start and stop so a watchdog or timer from an earlier run can tell it is stale. */
     @Volatile
     private var epoch = 0
@@ -114,10 +122,12 @@ class ServerService : Service() {
             }
             ACTION_SWITCH -> {
                 intent.getStringExtra(EXTRA_PROFILE)?.let { app.profiles.setActive(it) }
-                run { begin(apply = false) }
+                run { resetBudget(); begin(apply = false) }
             }
-            ACTION_RESTART -> run { begin(apply = false) }
-            ACTION_APPLY -> run { begin(apply = true) }
+            // A person's own retry gets a fresh restart budget; otherwise a server that crashed a few times over the
+            // last days would go straight back to the error screen on its next crash.
+            ACTION_RESTART -> run { resetBudget(); begin(apply = false) }
+            ACTION_APPLY -> run { resetBudget(); begin(apply = true) }
             else -> run { ensureRunning() }
         }
 
@@ -146,6 +156,28 @@ class ServerService : Service() {
     // Lifecycle
     private fun baseFor(profile: Profile) = "http://127.0.0.1:${profile.port}"
 
+    private fun resetBudget() {
+        restarts = 0
+        crashes.clear()
+    }
+
+    /** Waits for [port] to be released (the previous server may still be exiting). True when it is free. */
+    private fun awaitPort(port: Int?): Boolean {
+        val wanted = port ?: return false
+        val deadline = System.currentTimeMillis() + 3_000
+
+        while (true) {
+            if (PortPicker.free(wanted)) return true
+            if (System.currentTimeMillis() >= deadline) return false
+
+            try {
+                Thread.sleep(150)
+            } catch (_: InterruptedException) {
+                return false
+            }
+        }
+    }
+
     private fun begin(apply: Boolean) {
         if (app.prefs.remote) startRemote() else startLocal(apply)
     }
@@ -173,7 +205,8 @@ class ServerService : Service() {
         }
     }
 
-    private fun startLocal(apply: Boolean) {
+    /** [fromCrash]: a restart after a crash must not also swap in a freshly downloaded server build. */
+    private fun startLocal(apply: Boolean, fromCrash: Boolean = false) {
         val my = ++epoch
         var profile = app.profiles.active
         val password = app.prefs.password
@@ -207,6 +240,10 @@ class ServerService : Service() {
 
         // Every profile gets a port of its own. When something else on the phone already sits on it, the next
         // free port is taken and remembered, so the server starts anyway and the port stays individual.
+        // Our own previous server may still be letting go of the port; moving to another one now would be saved for
+        // good and change the web page's origin (and with it the page's stored data).
+        awaitPort(profile.port)
+
         var port = pickPort(profile)
 
         if (port == null) {
@@ -226,7 +263,7 @@ class ServerService : Service() {
 
         var base = baseFor(profile)
 
-        var otaDir = app.ota.prepareStart(profile, apply)
+        var otaDir = app.ota.prepareStart(profile, apply, auto = !fromCrash)
         var attempt = 0
         var shifts = 0
         var compatRetried = false
@@ -235,6 +272,8 @@ class ServerService : Service() {
             // The WARP tunnel has to be up before the server starts: the server reads its proxy address from the
             // environment at spawn time. When the tunnel cannot come up the server simply goes out directly.
             val warpProxy = app.warp.prepare(profile)
+
+            proxied = warpProxy != null
 
             val config = server.config(app.prefs, profile, bridgeUrl, otaDir, warpProxy)
             val process = try {
@@ -264,6 +303,13 @@ class ServerService : Service() {
 
             // Someone took the port between the check and the bind; move on to the next free one instead of failing.
             if (server.portWasBusy() && shifts < MAX_PORT_SHIFTS) {
+                // The holder may be the server just stopped: give it a moment and keep the port if it lets go.
+                if (awaitPort(port)) {
+                    shifts++
+
+                    continue
+                }
+
                 val next = pickPort(profile, port)
 
                 if (next != null) {
@@ -378,6 +424,7 @@ class ServerService : Service() {
         val my = epoch
         val next = ServerState.snapshot.generation + 1
         lastAliveAt = System.currentTimeMillis()
+        runningSince = lastAliveAt
 
         ServerState.update {
             it.copy(
@@ -417,6 +464,7 @@ class ServerService : Service() {
     private fun watchdog(my: Int, base: String, password: String) {
         Thread({
             var misses = 0
+            var tunnelMisses = 0
 
             while (epoch == my) {
                 try {
@@ -426,6 +474,19 @@ class ServerService : Service() {
                 }
 
                 if (epoch != my) return@Thread
+
+                // A server that was told to use the tunnel is useless once the tunnel is dead for good (every model
+                // request would end in "connection refused"): start again, without the proxy if it cannot come back.
+                if (proxied && app.warp.status.phase == WarpManager.Phase.FAILED) {
+                    if (++tunnelMisses >= 3) {
+                        Log.w("service", "the WARP tunnel is down for good, restarting the server")
+                        run { if (epoch == my) startLocal(apply = false) }
+
+                        return@Thread
+                    }
+                } else {
+                    tunnelMisses = 0
+                }
 
                 if (server.health(base, password) == 200) {
                     misses = 0
@@ -444,8 +505,9 @@ class ServerService : Service() {
 
         val now = System.currentTimeMillis()
 
-        // A crash after a long healthy stretch starts a fresh restart budget.
-        if (lastAliveAt > 0 && now - lastAliveAt > 10 * 60_000L) restarts = 0
+        // A crash after a long healthy stretch starts a fresh restart budget: how long this run stayed up, not how
+        // long ago it was last seen up (that is always seconds).
+        if (runningSince > 0 && lastAliveAt - runningSince > 10 * 60_000L) restarts = 0
 
         crashes.addLast(now)
 
@@ -458,6 +520,19 @@ class ServerService : Service() {
         if (app.ota.trial) {
             app.ota.failTrial(profile)
             Notifier.update(this, tr("Новая версия сервера работала нестабильно, возвращена предыдущая.", "The new server build was unstable, the previous one was restored."))
+        }
+
+        // Signal 11 on the very first crash: the compatibility mode is what fixes it, so do not burn minutes (and the
+        // restart budget) on crashes that cannot end differently.
+        if (!app.prefs.compat && server.crashedWithSegfault()) {
+            app.prefs.compat = true
+            crashes.clear()
+
+            Log.w("service", "signal 11 crash: compatibility mode is on, restarting")
+            Notifier.update(this, tr("Сервер упал; включён режим совместимости, перезапускаю...", "The server crashed; compatibility mode is on, restarting..."))
+            run { startLocal(apply = false, fromCrash = true) }
+
+            return
         }
 
         // Absolute budget: a server dying every minute never fills the 5-minute window, so without this the
@@ -483,7 +558,7 @@ class ServerService : Service() {
 
                 Log.w("service", "crash loop with signal 11: compatibility mode is on, restarting")
                 Notifier.update(this, tr("Сервер падал; включён режим совместимости, перезапускаю...", "The server kept crashing; compatibility mode is on, restarting..."))
-                run { startLocal(apply = false) }
+                run { startLocal(apply = false, fromCrash = true) }
 
                 return
             }
@@ -500,7 +575,7 @@ class ServerService : Service() {
 
         // Respawn through the worker queue, not on this watchdog thread: it serializes with other starts/stops and
         // an uncaught error here would take the whole process down.
-        run { startLocal(apply = false) }
+        run { startLocal(apply = false, fromCrash = true) }
     }
 
     private fun shutdown() {
