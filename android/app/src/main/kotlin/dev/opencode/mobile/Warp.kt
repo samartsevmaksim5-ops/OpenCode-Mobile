@@ -54,7 +54,9 @@ object Warp {
     class RegistrationException(message: String) : Exception(message)
 
     // X25519 (RFC 7748) over BigInteger: fine for a handful of one-time operations.
-    private val P = BigInteger.TWO.pow(255).subtract(BigInteger.valueOf(19))
+    // BigInteger.TWO exists only from Java 9; older Android runtimes crash with "No static field TWO", so build it.
+    private val TWO = BigInteger.valueOf(2)
+    private val P = TWO.pow(255).subtract(BigInteger.valueOf(19))
     private const val BASE_POINT = 9
 
     /** Derives the public key of a (already generated) X25519 private scalar. */
@@ -128,7 +130,7 @@ object Warp {
             tmp = z2; z2 = z3; z3 = tmp
         }
 
-        return encodeU(x2.multiply(z2.modPow(P.subtract(BigInteger.TWO), P)).mod(P))
+        return encodeU(x2.multiply(z2.modPow(P.subtract(TWO), P)).mod(P))
     }
 
     private fun clamp(scalar: ByteArray) {
@@ -375,12 +377,33 @@ object Warp {
             .map { it.first }
             .toList()
 
+    /** One line of a native crash register dump ("r10     0x72f160c140", "pc      0x192c0", "fault   0x0"). */
+    private val registerLine = Regex("^(?:[rx]\\d{1,2}|lr|sp|pc|fault|trap|err|oldmask)\\s+0x[0-9a-fA-F]+$")
+
     /**
      * The last non-empty lines of a tunnel log, capped to [maxChars] from the tail: what a failure quotes so the
      * person can see wireproxy's own reason ("bind: address already in use" and friends) instead of a guess.
+     *
+     * A Go runtime crash ends with thirty register lines that bury the actual reason; they are folded into a single
+     * "native crash" line (pc, lr, fault) so the reason printed above them stays visible.
      */
     fun logTail(log: String, maxChars: Int = 480): String {
-        val lines = log.lines().filter { it.isNotBlank() }
+        val all = log.lines().filter { it.isNotBlank() }
+        val registers = all.filter { registerLine.matches(it.trim()) }
+        val lines = ArrayList(all.filterNot { registerLine.matches(it.trim()) })
+
+        if (registers.size >= 8) {
+            fun reg(name: String) = registers.lastOrNull { it.trim().startsWith("$name ") || it.trim().startsWith("$name\t") }
+                ?.trim()?.substringAfter(' ')?.trim()
+
+            val parts = listOf("pc", "lr", "fault").mapNotNull { name -> reg(name)?.let { "$name=$it" } }
+
+            lines.add("native crash" + if (parts.isEmpty()) "" else " (" + parts.joinToString(" ") + ")")
+        } else {
+            lines.clear()
+            lines.addAll(all)
+        }
+
         val kept = ArrayList<String>()
         var size = 0
 

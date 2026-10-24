@@ -297,16 +297,21 @@ class ServerService : Service() {
             subscriptionProxy = useSubscription && outboundProxy != null
 
             if (!useSubscription && !Warp.proxySatisfiesRequirement(app.warp.requiredFor(profile), outboundProxy)) {
-                val detail = app.warp.status.detail.takeIf { it.isNotBlank() }
-                    ?: tr(
-                        "Cloudflare WARP включён, но туннель не подтверждён. Отключите WARP в настройках или проверьте сеть.",
-                        "Cloudflare WARP is enabled, but the tunnel was not verified. Turn WARP off in settings or check the network.",
-                    )
-                Log.w("service", "refusing to start OpenCode without the required WARP route: $detail")
-                proxied = false
-                fail(detail, false, profile)
+                // WARP is a network route, not a security boundary (a VPN subscription, which is, still fails closed
+                // above). When the tunnel cannot start on this phone - a crashing native binary, a network that blocks
+                // WireGuard - the server starts on the direct connection and says so, instead of leaving the person on
+                // an error screen with no way into the app. The reason stays in Settings and the log.
+                val detail = app.warp.status.detail.takeIf { it.isNotBlank() }.orEmpty()
 
-                return
+                Log.w("service", "WARP is required but unavailable, starting OpenCode on the direct connection: ${detail.lines().firstOrNull().orEmpty()}")
+                proxied = false
+                Notifier.update(
+                    this,
+                    tr(
+                        "WARP не запустился, OpenCode работает напрямую. Причина - в настройках, в разделе WARP.",
+                        "WARP could not start, so OpenCode runs on the direct connection. The reason is in Settings, under WARP.",
+                    ),
+                )
             }
 
             val config = server.config(app.prefs, profile, bridgeUrl, otaDir, outboundProxy)

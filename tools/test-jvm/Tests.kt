@@ -910,6 +910,7 @@ fun main(args: Array<String>) {
     testOpencodeStore()
     testWarp()
     testNetworkFeatures()
+    testGithubPlugins()
 
     println("passed: $passed, failed: ${failures.size}")
     failures.forEach { println("FAIL: $it") }
@@ -1132,6 +1133,15 @@ fun testWarp() {
     eq("log tail empty log", Warp.logTail("", 40), "")
     eq("log tail blank log", Warp.logTail(" \n\n", 40), "")
 
+    // A Go crash dump ends with register lines that would bury the reason printed above them.
+    val crash = "fatal error: unexpected signal\n" + (6..29).joinToString("\n") { "r$it      0x${it}f" } +
+        "\nlr      0xac0d0\nsp      0x72f15b54b0\npc      0x192c0\nfault   0x0"
+    val folded = Warp.logTail(crash)
+
+    check("crash dump keeps the reason", folded.startsWith("fatal error: unexpected signal"))
+    check("crash dump is folded", folded.lines().size == 2 && folded.contains("native crash (pc=0x192c0 lr=0xac0d0 fault=0x0)"))
+    check("few register-like lines stay", Warp.logTail("r1      0x1\npc      0x2", 480) == "r1      0x1\npc      0x2")
+
     // Limit recognition on the event stream.
     check("free limit event", Limits.carriesLimit("session.step.failed", "{\"error\":{\"type\":\"provider.free-limit\",\"message\":\"Free usage limit reached\"}}"))
     check("rate limit event", Limits.carriesLimit("session.step.failed", "{\"error\":{\"type\":\"provider.rate-limit\",\"status\":429}}"))
@@ -1216,4 +1226,46 @@ fun testNetworkFeatures() {
     response[3] = 0x83.toByte()
     check("DNS failure response rejected", !NetworkDiagnostics.validDnsResponse(response, 0xBEEF))
     eq("three DNS providers available", NetworkDiagnostics.resolvers.size, 3)
+}
+
+// Plugins from GitHub: addresses, directory listings, trust.
+fun testGithubPlugins() {
+    val short = GithubPlugins.parse("owner/my-plugin")
+
+    eq("short form", short, GithubPlugins.Source("owner", "my-plugin", null, null, false))
+    eq("short form with ref", GithubPlugins.parse("owner/my-plugin@v1.2")?.ref, "v1.2")
+    eq("github: prefix with ref", GithubPlugins.parse("github:owner/repo#dev"), GithubPlugins.Source("owner", "repo", "dev", null, false))
+    eq("repo link", GithubPlugins.parse("https://github.com/owner/repo"), GithubPlugins.Source("owner", "repo", null, null, false))
+    eq("repo link with .git and slash", GithubPlugins.parse("https://github.com/owner/repo.git/"), GithubPlugins.Source("owner", "repo", null, null, false))
+    eq("tree link", GithubPlugins.parse("https://github.com/owner/repo/tree/main/plugins"), GithubPlugins.Source("owner", "repo", "main", "plugins", false))
+    eq("blob link", GithubPlugins.parse("https://github.com/owner/repo/blob/main/src/tool.ts"), GithubPlugins.Source("owner", "repo", "main", "src/tool.ts", true))
+    eq("raw link", GithubPlugins.parse("https://raw.githubusercontent.com/owner/repo/main/p.js?x=1"), GithubPlugins.Source("owner", "repo", "main", "p.js", true))
+    check("blob of a non-script is refused", GithubPlugins.parse("https://github.com/owner/repo/blob/main/README.md") == null)
+    check("other hosts are refused", GithubPlugins.parse("https://example.com/owner/repo") == null)
+    check("traversal is refused", GithubPlugins.parse("https://github.com/owner/repo/tree/main/../x") == null)
+    check("empty is refused", GithubPlugins.parse("  ") == null)
+    check("single word is refused", GithubPlugins.parse("repo") == null)
+
+    eq("contents url root", GithubPlugins.contentsUrl(short!!, ""), "https://api.github.com/repos/owner/my-plugin/contents")
+    eq("contents url dir with ref", GithubPlugins.contentsUrl(short.copy(ref = "v1"), "plugins"), "https://api.github.com/repos/owner/my-plugin/contents/plugins?ref=v1")
+    eq("raw url default branch", GithubPlugins.rawUrl(short, "a/b.js"), "https://raw.githubusercontent.com/owner/my-plugin/HEAD/a/b.js")
+
+    check("typings are not plugins", !GithubPlugins.isPluginName("index.d.ts"))
+    check("tests are not plugins", !GithubPlugins.isPluginName("a.test.ts") && !GithubPlugins.isPluginName("a.spec.js"))
+    check("configs are not plugins", !GithubPlugins.isPluginName("vite.config.ts"))
+    check("scripts are plugins", GithubPlugins.isPluginName("Tool.ts") && GithubPlugins.isPluginName("x.mjs"))
+
+    val listing = """[
+        {"name":"b.js","path":"plugins/b.js","type":"file","size":120,"download_url":"https://raw.githubusercontent.com/o/r/HEAD/plugins/b.js"},
+        {"name":"a.ts","path":"plugins/a.ts","type":"file","size":90,"download_url":"https://raw.githubusercontent.com/o/r/HEAD/plugins/a.ts"},
+        {"name":"a.d.ts","path":"plugins/a.d.ts","type":"file","size":9,"download_url":"https://raw.githubusercontent.com/o/r/HEAD/plugins/a.d.ts"},
+        {"name":"sub","path":"plugins/sub","type":"dir","size":0,"download_url":null},
+        {"name":"evil.js","path":"plugins/evil.js","type":"file","size":10,"download_url":"https://evil.example/evil.js"},
+        {"name":"big.js","path":"plugins/big.js","type":"file","size":99999999,"download_url":"https://raw.githubusercontent.com/o/r/HEAD/plugins/big.js"},
+        {"name":"README.md","path":"plugins/README.md","type":"file","size":5,"download_url":"https://raw.githubusercontent.com/o/r/HEAD/plugins/README.md"}
+    ]"""
+
+    eq("listing keeps plugin files only, sorted", GithubPlugins.candidates(listing).map { it.name }, listOf("a.ts", "b.js"))
+    eq("single-file reply has no candidates", GithubPlugins.candidates("{\"name\":\"a.js\",\"type\":\"file\"}"), emptyList<GithubPlugins.Candidate>())
+    eq("garbage has no candidates", GithubPlugins.candidates("not json"), emptyList<GithubPlugins.Candidate>())
 }

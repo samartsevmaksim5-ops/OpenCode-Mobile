@@ -82,10 +82,11 @@ class PluginsActivity : ExtScreen() {
         card.divide()
         card.action(tr("Установить из файла", "Install from a file"), primary = true) { pickForInstall = true; pickFile() }
         card.action(tr("Установить по ссылке", "Install from a link")) { askUrl() }
+        card.action(tr("Установить с GitHub", "Install from GitHub")) { askGithub() }
         note(
             tr(
-                "Подойдут .js и .ts файлы плагинов OpenCode. Телефон спросит, какой файл взять.",
-                "OpenCode plugin .js and .ts files work. The phone will ask which file to take.",
+                "Подойдут .js и .ts файлы плагинов OpenCode. С GitHub можно указать репозиторий (владелец/имя, владелец/имя@ветка) или ссылку на файл.",
+                "OpenCode plugin .js and .ts files work. From GitHub, give a repository (owner/name, owner/name@branch) or a link to a file.",
             ),
         )
     }
@@ -234,6 +235,79 @@ class PluginsActivity : ExtScreen() {
             }
 
             download(url)
+        }
+    }
+
+    // From a GitHub repository
+    private fun askGithub() {
+        Ui.input(this, tr("Репозиторий или ссылка GitHub", "GitHub repository or link"), "owner/opencode-plugin", "") { value ->
+            if (value.isBlank()) return@input
+
+            val source = GithubPlugins.parse(value)
+
+            if (source == null) {
+                Ui.toast(this, tr("Не удалось разобрать адрес. Пример: владелец/репозиторий или ссылка на файл .js/.ts", "Could not read that address. Example: owner/repo or a link to a .js/.ts file"))
+
+                return@input
+            }
+
+            if (source.isFile) {
+                download(GithubPlugins.rawUrl(source, source.path.orEmpty()))
+            } else {
+                findOnGithub(source)
+            }
+        }
+    }
+
+    /** Looks for plugin files in the repository's usual places, then installs the only one or asks which to take. */
+    private fun findOnGithub(source: GithubPlugins.Source) {
+        Ui.toast(this, tr("Ищу плагины в ${source.owner}/${source.repo}...", "Looking for plugins in ${source.owner}/${source.repo}..."))
+
+        Thread({
+            try {
+                val dirs = if (source.path != null) listOf(source.path) else GithubPlugins.SEARCH_DIRS
+                var found = emptyList<GithubPlugins.Candidate>()
+
+                for (dir in dirs) {
+                    found = GithubPlugins.candidates(getText(GithubPlugins.contentsUrl(source, dir)) ?: continue)
+
+                    if (found.isNotEmpty()) break
+                }
+
+                runOnUiThread {
+                    if (isFinishing || isDestroyed) return@runOnUiThread
+
+                    when {
+                        found.isEmpty() -> Ui.toast(this, tr("В репозитории нет файлов плагинов (.js/.ts)", "No plugin files (.js/.ts) in that repository"))
+                        found.size == 1 -> download(found[0].downloadUrl)
+                        else -> Ui.choose(this, tr("Какой плагин установить?", "Which plugin to install?"), found.map { it.path }) { download(found[it].downloadUrl) }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w("plugins", "github lookup failed: ${e.message}")
+                runOnUiThread { if (!isFinishing && !isDestroyed) Ui.toast(this, tr("Не удалось получить список файлов: ", "Could not list the files: ") + (e.message ?: "")) }
+            }
+        }, "plugin-github").apply { isDaemon = true; start() }
+    }
+
+    /** A GitHub API reply as text, or null when the path does not exist (a missing folder is not an error here). */
+    private fun getText(url: String): String? {
+        val connection = URL(url).openConnection() as HttpURLConnection
+
+        try {
+            connection.connectTimeout = 15_000
+            connection.readTimeout = 30_000
+            connection.setRequestProperty("Accept", "application/vnd.github+json")
+            connection.setRequestProperty("User-Agent", "OpenCode-Android/${BuildConfig.VERSION_NAME}")
+
+            return when (val code = connection.responseCode) {
+                200 -> connection.inputStream.use { it.readBytes() }.toString(Charsets.UTF_8)
+                404 -> null
+                403, 429 -> throw IllegalStateException(tr("GitHub временно ограничил запросы, попробуйте позже", "GitHub is rate limiting requests, try again later"))
+                else -> throw IllegalStateException("HTTP $code")
+            }
+        } finally {
+            connection.disconnect()
         }
     }
 

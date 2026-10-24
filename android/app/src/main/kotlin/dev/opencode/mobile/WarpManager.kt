@@ -141,6 +141,9 @@ class WarpManager(private val paths: Paths, private val prefs: Prefs) {
                 val detail = failureDetail(e.message ?: "failed")
 
                 Log.w("warp", "prepare failed: $detail")
+
+                // A tunnel that cannot start must not be respawned in the background while the server runs without it.
+                wantRunning = false
                 update(Phase.FAILED, detail)
                 runCatching { process?.destroy() }
                 process = null

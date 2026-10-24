@@ -60,6 +60,13 @@ class App : Application() {
         warp = WarpManager(paths, prefs)
         Log.setStage("Application.onCreate: initializing VPN subscriptions")
         vpn = VpnSubscriptionManager(paths, prefs)
+        // Update checks fall back to the running tunnels when GitHub cannot be reached directly.
+        ota.fallbackProxies = {
+            listOfNotNull(
+                vpn.proxyUrl.takeIf { vpn.listening() },
+                Warp.PROXY_URL.takeIf { warp.listening() },
+            )
+        }
         // A device with a broken notification service must still let the app open; startForeground failures are
         // handled where they happen.
         Log.setStage("Application.onCreate: initializing notifications")

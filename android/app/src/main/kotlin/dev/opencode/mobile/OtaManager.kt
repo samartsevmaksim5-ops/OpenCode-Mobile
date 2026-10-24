@@ -204,25 +204,30 @@ class OtaManager(private val context: Context, private val paths: Paths, private
     /** Downloads [url] to [dest] and fails unless it has exactly the announced size and SHA-256. Used for the APK too. */
     fun fetch(url: String, size: Long, sha256: String, dest: File, progress: (Int) -> Unit) {
         dest.parentFile?.mkdirs()
-        dest.delete()
 
-        val http = open(url)
-
-        try {
-            if (http.responseCode != 200) throw IOException("HTTP ${http.responseCode}")
-
-            val (hash, length) = FileOutputStream(dest).use { out ->
-                OtaVerifier.copyHashed(http.inputStream, out, size) { done -> progress((done * 100 / size).toInt().coerceIn(0, 100)) }
-            }
-
-            if (length != size) throw OtaException(tr("Размер файла не совпадает с объявленным", "File size differs from the announced size"))
-            if (hash != sha256) throw OtaException(tr("Контрольная сумма не совпала", "Checksum mismatch"))
-        } catch (e: Exception) {
+        routed { proxy ->
             dest.delete()
 
-            throw e
-        } finally {
-            http.disconnect()
+            val http = open(url, proxy)
+
+            try {
+                if (http.responseCode != 200) throw IOException("HTTP ${http.responseCode}")
+
+                val (hash, length) = FileOutputStream(dest).use { out ->
+                    OtaVerifier.copyHashed(http.inputStream, out, size) { done -> progress((done * 100 / size).toInt().coerceIn(0, 100)) }
+                }
+
+                if (length != size) throw OtaException(tr("Размер файла не совпадает с объявленным", "File size differs from the announced size"))
+                if (hash != sha256) throw OtaException(tr("Контрольная сумма не совпала", "Checksum mismatch"))
+
+                Unit
+            } catch (e: Exception) {
+                dest.delete()
+
+                throw e
+            } finally {
+                http.disconnect()
+            }
         }
     }
 
@@ -368,10 +373,57 @@ class OtaManager(private val context: Context, private val paths: Paths, private
 
     fun unmeteredNow(): Boolean = unmetered()
 
-    private fun open(url: String): HttpURLConnection {
+    /**
+     * Local HTTP proxies that are up right now (a VPN subscription, the WARP tunnel). GitHub is blocked or flaky on
+     * some networks - the log's "Unable to resolve host github.com" - and the same tunnels that carry the server's
+     * traffic then carry the update check too. Set by the app; empty means direct connections only.
+     */
+    @Volatile
+    var fallbackProxies: () -> List<String> = { emptyList() }
+
+    /** True once a direct connection failed while a tunnel worked: the tunnel is tried first from then on. */
+    @Volatile
+    private var directFailed = false
+
+    /**
+     * Runs one network operation over the direct route and, when that fails the way a blocked network does, over each
+     * available tunnel. Verification failures and HTTP error replies are answers, not outages, and are never retried.
+     */
+    private fun <T> routed(op: (java.net.Proxy?) -> T): T {
+        val tunnels = runCatching { fallbackProxies() }.getOrDefault(emptyList()).mapNotNull { runCatching { toProxy(it) }.getOrNull() }
+        val order: List<java.net.Proxy?> = if (directFailed) tunnels + listOf<java.net.Proxy?>(null) else listOf<java.net.Proxy?>(null) + tunnels
+        var failure: IOException? = null
+
+        for (route in order) {
+            try {
+                val result = op(route)
+
+                directFailed = route != null
+
+                return result
+            } catch (e: IOException) {
+                if (!isOutage(e)) throw e
+
+                failure = e
+                Log.w("ota", "${if (route == null) "direct" else "tunnel"} route failed: ${e.message}")
+            }
+        }
+
+        throw failure ?: IOException("No route to the update server")
+    }
+
+    private fun isOutage(e: IOException): Boolean = !(e.message ?: "").startsWith("HTTP ") && e.message != "Reply is too large"
+
+    private fun toProxy(url: String): java.net.Proxy {
+        val parsed = URL(url)
+
+        return java.net.Proxy(java.net.Proxy.Type.HTTP, java.net.InetSocketAddress(parsed.host, parsed.port))
+    }
+
+    private fun open(url: String, proxy: java.net.Proxy? = null): HttpURLConnection {
         require(url.startsWith("https://")) { "Only https addresses are allowed" }
 
-        val http = URL(url).openConnection() as HttpURLConnection
+        val http = (if (proxy == null) URL(url).openConnection() else URL(url).openConnection(proxy)) as HttpURLConnection
 
         http.connectTimeout = 15_000
         http.readTimeout = 30_000
@@ -382,8 +434,8 @@ class OtaManager(private val context: Context, private val paths: Paths, private
         return http
     }
 
-    private fun getBytes(url: String, limit: Int): ByteArray {
-        val http = open(url)
+    private fun getBytes(url: String, limit: Int): ByteArray = routed { proxy ->
+        val http = open(url, proxy)
 
         try {
             if (http.responseCode != 200) throw IOException("HTTP ${http.responseCode}")
@@ -403,7 +455,7 @@ class OtaManager(private val context: Context, private val paths: Paths, private
                 }
             }
 
-            return out.toByteArray()
+            out.toByteArray()
         } finally {
             http.disconnect()
         }
