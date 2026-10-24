@@ -6,7 +6,12 @@
 set -euo pipefail
 
 dest="${1:?usage: fetch-wireproxy.sh <out-dir>}"
-version="${WIREPROXY_VERSION:-1.1.3}"
+# v1.0.7 is the last release before wireproxy started sandboxing itself with Landlock. From v1.0.8 on, main() calls
+# landlock_create_ruleset (syscall 444) before anything else - even for --version - and Android's app seccomp filter
+# answers an unknown syscall with SIGSYS instead of ENOSYS, so the Go runtime dies with a register dump right at start
+# ("The tunnel exited while starting", pc just after an svc, x8 = 0x1bc). Same family as golang/go#70508. Neither a flag
+# nor the config turns the sandbox off, so newer releases cannot be used here until that changes.
+version="${WIREPROXY_VERSION:-1.0.7}"
 repo="${WIREPROXY_REPO:-windtf/wireproxy}"
 
 mkdir -p "$dest"
@@ -15,9 +20,9 @@ trap 'rm -rf "$work"' EXIT
 
 url="https://github.com/${repo}/releases/download/v${version}/wireproxy_linux_arm64.tar.gz"
 
-# Pinned checksum of the v1.1.3 arm64 asset (verified against the official release): the binary carries the tunnel's
+# Pinned checksum of the v1.0.7 arm64 asset (verified against the official release): the binary carries the tunnel's
 # WireGuard keys and ships inside the APK, so a silently retagged release must not slip in.
-expected_sha="370e00bd2167960d1ecd1c3c1439715bbaa94a0a110a2040468670c9af6021b6"
+expected_sha="4acadcd4e74a40bb798d207b3d25b4b5f43cfddc39f9beb78fe5badf428b47a6"
 
 echo "fetch-wireproxy: $url"
 curl -fsSL --retry 3 --max-time 300 -o "$work/wireproxy.tar.gz" "$url"
@@ -28,6 +33,12 @@ tar -xzf "$work/wireproxy.tar.gz" -C "$work" wireproxy
 
 # The machine check the fetch-proot.sh contract uses: has to be an aarch64 static binary.
 file "$work/wireproxy" | grep -qi "statically linked" || { echo "wireproxy is not statically linked" >&2; exit 1; }
+
+# A build with the Landlock sandbox crashes on Android at start (see above); refuse to ship one, whatever the pin says.
+if grep -qa "landlock" "$work/wireproxy"; then
+  echo "wireproxy ${version} contains the Landlock sandbox and crashes on Android; use v1.0.7 or build without it" >&2
+  exit 1
+fi
 
 install -m 0755 "$work/wireproxy" "$dest/libwireproxy.so"
 echo "fetch-wireproxy: installed $dest/libwireproxy.so ($(wc -c < "$dest/libwireproxy.so") bytes)"
