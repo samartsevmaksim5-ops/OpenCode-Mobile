@@ -33,6 +33,7 @@ function check(name, ok, detail) {
       terminalFocus: (f) => window.calls.push(["terminal", f]),
       copyText: (t) => window.calls.push(["copy", t]),
       openLogin: () => window.calls.push(["login"]),
+      hasAccount: () => window.accountConnected === true,
     };
   });
   await page.evaluate(bridge);
@@ -135,7 +136,7 @@ function check(name, ok, detail) {
   const copied = await page.evaluate(() => window.calls.filter((c) => c[0] === "copy").map((c) => c[1]));
   check("clipboard fallback", copied.includes("copied text"), JSON.stringify(copied));
 
-  // 8. A bare quota error becomes an honest explanation (wait for the reset or sign in) plus the sign-in offer.
+  // 8. A limit error is shown exactly as the server sent it. Under it the page adds one hint with a sign-in button.
   // Quota errors are provider answers: the page must NOT ask the app to rebuild any tunnel over them.
   const quota = await page.evaluate(async (src) => {
     window.__ocAndroidBridge = false;
@@ -147,22 +148,114 @@ function check(name, ok, detail) {
     host.appendChild(p);
     document.body.appendChild(host);
     await new Promise((r) => setTimeout(r, 900));
-    // The button goes next to the message block, never inside it.
-    const button = p.querySelector("button") || p.nextElementSibling;
+    // The hint goes next to the message block, never inside it.
+    const hint = p.nextElementSibling;
+    const button = hint && hint.querySelector("[data-oc-signin]");
     const callsBefore = window.calls.length;
     if (button) button.click();
     await new Promise((r) => setTimeout(r, 100));
+    // Several more scan cycles: the hint must neither multiply nor be scanned as an error itself.
+    await new Promise((r) => setTimeout(r, 1500));
+    const hintsWhileError = host.parentElement.querySelectorAll("[data-oc-hint]").length;
+    // The error goes away (retry succeeded): the hint goes with it.
+    p.textContent = "All good";
+    await new Promise((r) => setTimeout(r, 1500));
+    const hintsAfterFix = document.querySelectorAll("[data-oc-hint]").length;
+    p.textContent = "Error: insufficient quota";
+    await new Promise((r) => setTimeout(r, 1500));
+    const hintsWhenBack = document.querySelectorAll("[data-oc-hint]").length;
     return {
       text: p.textContent,
+      hasHint: !!(hint && hint.hasAttribute("data-oc-hint")),
       buttonText: button && button.textContent,
       opened: window.calls.slice(callsBefore).some((c) => c[0] === "login"),
       rotated: window.calls.some((c) => c[0] === "warp"),
+      hintsWhileError,
+      hintsAfterFix,
+      hintsWhenBack,
     };
   }, bridge);
-  check("quota text replaced", quota.text.includes("free-model limit") && quota.text.includes("quota to reset"), JSON.stringify(quota));
-  check("quota button text", quota.buttonText === "\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u044c Gmail", String(quota.buttonText));
+  check("error text kept as is", quota.text === "Error: insufficient quota", JSON.stringify(quota));
+  check("hint added after the error", quota.hasHint === true, JSON.stringify(quota));
+  // The page in this harness is English, so the offer follows the page language (the old label was hardcoded Russian).
+  check("quota button text", quota.buttonText === "Connect account", String(quota.buttonText));
   check("quota button opens sign-in", quota.opened === true);
   check("quota never asks for a WARP rotation", quota.rotated === false);
+  check("one hint per error", quota.hintsWhileError === 1, JSON.stringify(quota));
+  check("hint removed when the error is gone", quota.hintsAfterFix === 0, JSON.stringify(quota));
+  check("hint returns when the limit returns", quota.hintsWhenBack === 1, JSON.stringify(quota));
+
+  // 8a. Russian limit wording and plain "429" status text are recognised too; a bare mention of 429 is not.
+  // The English cases are the texts OpenCode Zen actually sends (see Limits.kt): "Free usage exceeded,
+  // subscribe to Go" and the FreeUsageLimitError form used by the gateway.
+  const wording = await page.evaluate(async () => {
+    const make = (text) => {
+      const host = document.createElement("div");
+      host.setAttribute("role", "alert");
+      const p = document.createElement("p");
+      p.textContent = text;
+      host.appendChild(p);
+      document.body.appendChild(host);
+      return p;
+    };
+    const ru = make("\u041b\u0438\u043c\u0438\u0442 \u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d");
+    const status = make("Request failed: status 429");
+    const other = make("Error 4290: file not found");
+    const zen = make("Free usage exceeded, subscribe to Go");
+    const camel = make("FreeUsageLimitError: daily free usage limit");
+    // A Russian-language page gets a Russian offer, matching the hint text.
+    document.documentElement.lang = "ru";
+    const ruBtn = make("Insufficient quota");
+    document.documentElement.lang = "";
+    await new Promise((r) => setTimeout(r, 900));
+    const has = (p) => !!(p.nextElementSibling && p.nextElementSibling.hasAttribute("data-oc-hint"));
+    const ruBox = ruBtn.nextElementSibling;
+    const ruLabel = ruBox && ruBox.querySelector("[data-oc-signin]");
+    return {
+      ru: has(ru),
+      status: has(status),
+      other: has(other),
+      zen: has(zen),
+      camel: has(camel),
+      ruBtnLabel: ruLabel && ruLabel.textContent,
+      ruBtnHint: has(ruBtn),
+      ruText: ru.textContent,
+      otherText: other.textContent,
+      zenText: zen.textContent,
+    };
+  });
+  check("russian limit gets a hint", wording.ru === true && wording.ruText === "\u041b\u0438\u043c\u0438\u0442 \u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d", JSON.stringify(wording));
+  check("status 429 gets a hint", wording.status === true, JSON.stringify(wording));
+  check("unrelated number gets no hint", wording.other === false && wording.otherText === "Error 4290: file not found", JSON.stringify(wording));
+  check("zen free usage exceeded gets a hint", wording.zen === true && wording.zenText === "Free usage exceeded, subscribe to Go", JSON.stringify(wording));
+  check("FreeUsageLimitError gets a hint", wording.camel === true, JSON.stringify(wording));
+  check("russian page gets a russian offer", wording.ruBtnHint === true && wording.ruBtnLabel === "\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0430\u043a\u043a\u0430\u0443\u043d\u0442", JSON.stringify(wording));
+
+  // 8c. A profile with a connected account: the hint explains the personal limit and offers no sign-in button.
+  const signed = await page.evaluate(async (src) => {
+    window.accountConnected = true;
+    window.__ocAndroidBridge = false;
+    (0, eval)(src);
+    const host = document.createElement("div");
+    host.setAttribute("role", "alert");
+    const p = document.createElement("p");
+    p.textContent = "Error: Rate limit exceeded. Please try again later.";
+    host.appendChild(p);
+    document.body.appendChild(host);
+    await new Promise((r) => setTimeout(r, 900));
+    const hint = p.nextElementSibling;
+    const result = {
+      hint: !!(hint && hint.hasAttribute("data-oc-hint")),
+      button: hint ? !!hint.querySelector("[data-oc-signin]") : null,
+      text: p.textContent,
+      hintText: hint && hint.textContent,
+    };
+    window.accountConnected = false;
+    return result;
+  }, bridge);
+  check("signed-in error keeps text", signed.text === "Error: Rate limit exceeded. Please try again later.", JSON.stringify(signed));
+  check("signed-in hint without button", signed.hint === true && signed.button === false, JSON.stringify(signed));
+  check("signed-in hint speaks of the personal limit", signed.hintText.includes("another model") && !signed.hintText.includes("Connect account"), String(signed.hintText));
 
   // 8b. The watcher must not touch ordinary text or terminal output that merely mentions a limit.
   const negative = await page.evaluate(async () => {
@@ -179,13 +272,13 @@ function check(name, ok, detail) {
     return {
       plain: plain.textContent,
       line: line.textContent,
-      // The watcher inserts a button as the paragraph's next sibling; look there, not anywhere in the body.
-      plainButton: !!(plain.nextElementSibling && plain.nextElementSibling.hasAttribute("data-oc-signin")),
-      termButton: !!term.querySelector('[data-oc-signin]'),
+      // The watcher inserts a hint as the paragraph's next sibling; look there, not anywhere in the body.
+      plainHint: !!(plain.nextElementSibling && plain.nextElementSibling.hasAttribute("data-oc-hint")),
+      termHint: !!term.querySelector("[data-oc-hint]") || !!(term.nextElementSibling && term.nextElementSibling.hasAttribute("data-oc-hint")),
     };
   });
-  check("plain text untouched", negative.plain.includes("request limit") && !negative.plainButton, JSON.stringify(negative));
-  check("terminal untouched", negative.line === "insufficient quota for this team" && !negative.termButton, JSON.stringify(negative));
+  check("plain text untouched", negative.plain.includes("request limit") && !negative.plainHint, JSON.stringify(negative));
+  check("terminal untouched", negative.line === "insufficient quota for this team" && !negative.termHint, JSON.stringify(negative));
 
   // 9. Without the native interface the script does nothing and does not throw.
   const quiet = await context.newPage();

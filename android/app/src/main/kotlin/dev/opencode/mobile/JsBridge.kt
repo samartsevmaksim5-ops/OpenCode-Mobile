@@ -44,6 +44,17 @@ class JsBridge(private val activity: MainActivity) {
         activity.runOnUiThread { activity.showPreview(url) }
     }
 
+    /**
+     * True when this profile already has a Console account (or a sign-in completed on this install), so the web UI
+     * must not offer the sign-in again under a limit error. Read on the WebView's thread: both sources are cheap.
+     */
+    @JavascriptInterface
+    fun hasAccount(): Boolean {
+        val app = activity.applicationContext as App
+
+        return app.prefs.signedIn || app.profiles.active.account != null
+    }
+
     /** The sign-in offer shown instead of a raw quota error opens the native sign-in screen. */
     @JavascriptInterface
     fun openLogin() {
